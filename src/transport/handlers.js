@@ -69,23 +69,17 @@ async function onJoin(session, d) {
   if (session.named) return fail(session.ws, 'FORBIDDEN', 'You have already joined.');
 
   if (config.AUTH_ENABLED) {
-    // With accounts on, a username in the payload is ignored ENTIRELY. The
-    // display name is read off the account, so no client can claim to be
-    // somebody else.
-    let user;
-    try {
-      user = await auth.resolveToken(d && d.token);
-    } catch (err) {
-      log.error('token lookup failed:', err.message);
-      return fail(session.ws, 'UNAVAILABLE', 'The account store could not be reached.');
-    }
-    if (!alive(session) || session.named) return; // raced: closed, or a second join won
+    // The identity was settled at the upgrade, from the session cookie. A
+    // username in the payload is ignored entirely.
+    const user = session.user;
     if (!user) return fail(session.ws, 'UNAUTHORIZED', 'Sign in again.');
 
     const holder = hub.names.get(user.name.toLowerCase());
     if (holder && holder !== session.id) {
       return fail(session.ws, 'NAME_TAKEN', 'That account is already connected here.');
     }
+    // The immutable account id. `sender_id` everywhere downstream binds to
+    // this, never to the display name, which /nick can change.
     session.userId = user.id;
     claimName(session, user.name);
   } else {
@@ -118,7 +112,7 @@ async function onNick(session, d) {
     // With accounts on this renames the ACCOUNT, so it survives sign-out.
     let ok;
     try {
-      ok = await auth.store.renameUser(session.userId, name);
+      ok = await auth.renameUser(session.userId, name);
     } catch (err) {
       log.error('rename failed:', err.message);
       return fail(session.ws, 'UNAVAILABLE', 'The account store could not be reached.');

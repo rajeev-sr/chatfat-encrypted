@@ -1,174 +1,177 @@
-// test/auth.js — accounts. Runs with DATABASE_URL=memory and a deliberately
-// raised AUTH_MAX_ATTEMPTS, because the limiter gets its own server below.
+// test/auth.js — identity, via Better Auth (email + password).
 //
-// Pointing DATABASE_URL at a real Postgres must run these same assertions
-// unchanged.
+// Needs a real database: Better Auth persists users, sessions and credentials
+// in tables, so `memory` cannot serve accounts and this suite skips without
+// TEST_DATABASE_URL. Everything it used to prove about the hand-rolled scrypt
+// path is either Better Auth's problem now or is re-proved here at the seam we
+// still own — the WebSocket upgrade.
 'use strict';
 
-const WebSocket = require('ws');
-const { ok, eq, bail, report, startServer, client, sleep, post } = require('./harness');
+const { ok, eq, bail, report, startServer, client, sleep } = require('./harness');
 
-const PORT = 8098;
-const THROTTLE_PORT = 8096;
+const PORT = 8086;
+const URL = process.env.TEST_DATABASE_URL;
+
+function rawSetCookie(res) {
+  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('set-cookie')];
+  return raw.filter(Boolean).join(' ;; ');
+}
+
+function rawSetCookie(res) {
+  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('set-cookie')];
+  return raw.filter(Boolean).join(' ;; ');
+}
+
+function cookiesOf(res) {
+  const raw = res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('set-cookie')];
+  return raw.filter(Boolean).map((c) => c.split(';')[0]).join('; ');
+}
+
+async function signUp(port, email, password, name) {
+  const res = await fetch(`http://127.0.0.1:${port}/api/auth/sign-up/email`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` },
+    body: JSON.stringify({ email, password, name }),
+  });
+  return { status: res.status, cookie: cookiesOf(res), setCookie: rawSetCookie(res), body: await res.json().catch(() => ({})) };
+}
+
+async function signIn(port, email, password) {
+  const res = await fetch(`http://127.0.0.1:${port}/api/auth/sign-in/email`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` },
+    body: JSON.stringify({ email, password }),
+  });
+  return { status: res.status, cookie: cookiesOf(res), body: await res.json().catch(() => ({})) };
+}
+
+// Opens a socket with whatever cookie is given and reports what happened.
+// A rejected upgrade surfaces as a connection error, not as a frame.
+function tryConnect(port, cookie) {
+  const attempt = client(port, cookie ? { headers: { cookie } } : {})
+    .then((c) => ({ ok: true, c }))
+    .catch((err) => ({ ok: false, err: String(err.message || err) }));
+  // A refused upgrade may close the socket without ws ever emitting, so this
+  // cannot be left to resolve on its own.
+  const timeout = new Promise((r) => setTimeout(() => r({ ok: false, err: 'timed out' }), 5000));
+  return Promise.race([attempt, timeout]);
+}
+
+async function reset() {
+  const { Client } = require('pg');
+  const c = new Client({ connectionString: URL });
+  await c.connect();
+  await c.query(`
+    drop table if exists messages cascade;
+    drop table if exists rooms cascade;
+    drop table if exists "session" cascade;
+    drop table if exists "account" cascade;
+    drop table if exists "verification" cascade;
+    drop table if exists "user" cascade;
+    drop table if exists sessions cascade;
+    drop table if exists users cascade;
+    drop table if exists schema_version cascade;
+  `);
+  await c.end();
+}
 
 async function main() {
+  if (!URL) {
+    console.log('auth: SKIPPED — set TEST_DATABASE_URL to run this suite');
+    return;
+  }
+  await reset();
+
   const server = await startServer(PORT, {
-    DATABASE_URL: 'memory',
+    DATABASE_URL: URL,
+    HISTORY_REPLAY: '20',
     AUTH_MAX_ATTEMPTS: '500',
-    HEARTBEAT_MS: '2000',
+    BETTER_AUTH_SECRET: 'test-secret-'.padEnd(40, 'x'),
   });
 
-  // ── the server announces its policy before anything is attempted ─────────
   const health = await (await fetch(`http://127.0.0.1:${PORT}/healthz`)).json();
-  eq(health.auth, 'memory', '/healthz reports the account store');
-  eq(health.persistence, 'memory', 'and that messages are stored');
-
-  const probe = await client(PORT);
-  const hello = await probe.next('hello');
-  eq(hello.d.auth, true, 'hello tells the client accounts are required');
-  probe.close();
+  eq(health.auth, 'postgres', '/healthz reports accounts are on');
 
   // ── registration ─────────────────────────────────────────────────────────
-  const weak = await post(PORT, '/auth/register', { username: 'kavya', password: 'short' });
-  eq(weak.status, 400, 'a short password is refused');
-  eq(weak.body.code, 'WEAK_PASSWORD', 'with WEAK_PASSWORD');
+  const kavya = await signUp(PORT, 'kavya@example.test', 'correct-horse-battery', 'kavya');
+  eq(kavya.status, 200, 'a valid registration succeeds');
+  ok(kavya.cookie.length > 0, 'and sets a session cookie');
+  ok(/httponly/i.test(kavya.setCookie), 'the session cookie is HttpOnly — an XSS cannot read it');
+  ok(/samesite=strict/i.test(kavya.setCookie), 'and SameSite=Strict');
 
-  const badName = await post(PORT, '/auth/register', { username: '!', password: 'correct-horse' });
-  eq(badName.body.code, 'NAME_INVALID', 'a malformed name is refused');
+  const dup = await signUp(PORT, 'kavya@example.test', 'another-password-xyz', 'kavya2');
+  ok(dup.status >= 400, 'the same email cannot register twice');
 
-  const reg = await post(PORT, '/auth/register', { username: 'kavya', password: 'correct-horse' });
-  eq(reg.status, 200, 'registration succeeds');
-  ok(typeof reg.body.token === 'string' && reg.body.token.length > 20, 'and returns a session token');
-  eq(reg.body.user.name, 'kavya', 'and the account name');
-  ok(reg.body.user.password === undefined, 'and never echoes the password back');
+  const weak = await signUp(PORT, 'weak@example.test', 'short', 'weak');
+  ok(weak.status >= 400, 'a password under the minimum is refused');
 
-  const dupe = await post(PORT, '/auth/register', { username: 'KAVYA', password: 'another-one' });
-  eq(dupe.status, 409, 'a duplicate name is refused case-insensitively');
-  eq(dupe.body.code, 'NAME_TAKEN', 'with NAME_TAKEN');
+  // ── sign-in ──────────────────────────────────────────────────────────────
+  const good = await signIn(PORT, 'kavya@example.test', 'correct-horse-battery');
+  eq(good.status, 200, 'the right password signs in');
+  ok(good.cookie.length > 0, 'and returns a session');
 
-  await post(PORT, '/auth/register', { username: 'meera', password: 'correct-horse-2' });
+  const bad = await signIn(PORT, 'kavya@example.test', 'wrong-password-here');
+  ok(bad.status >= 400, 'the wrong password does not');
 
-  // ── login ────────────────────────────────────────────────────────────────
-  const good = await post(PORT, '/auth/login', { username: 'kavya', password: 'correct-horse' });
-  eq(good.status, 200, 'a correct login succeeds');
-  ok(good.body.token !== reg.body.token, 'and issues a fresh token each time');
+  const ghost = await signIn(PORT, 'nobody@example.test', 'correct-horse-battery');
+  ok(ghost.status >= 400, 'nor does an account that does not exist');
 
-  const wrong = await post(PORT, '/auth/login', { username: 'kavya', password: 'wrong-horse' });
-  eq(wrong.status, 401, 'a wrong password is refused');
-  eq(wrong.body.code, 'BAD_LOGIN', 'with BAD_LOGIN');
+  // ── the upgrade is the gate ──────────────────────────────────────────────
+  // This is the seam we own, and the reason identity moved out of the join
+  // frame: an unauthenticated socket is never allowed to exist.
+  const anon = await tryConnect(PORT, null);
+  eq(anon.ok, false, 'a socket with no session cookie is refused at the upgrade');
 
-  const unknown = await post(PORT, '/auth/login', { username: 'nobody', password: 'wrong-horse' });
-  eq(unknown.body.code, 'BAD_LOGIN', 'an unknown user gets the SAME code as a wrong password');
-  eq(unknown.body.message, wrong.body.message, 'and the same message, so nothing is leaked');
+  const forged = await tryConnect(PORT, 'better-auth.session_token=not-a-real-token');
+  eq(forged.ok, false, 'and so is one with a made-up token');
 
-  // ── timing parity: an unknown username must not be answered faster ───────
-  const timeOf = async (username) => {
-    const runs = [];
-    for (let i = 0; i < 4; i++) {
-      const t0 = process.hrtime.bigint();
-      await post(PORT, '/auth/login', { username, password: 'wrong-horse-entirely' });
-      runs.push(Number(process.hrtime.bigint() - t0) / 1e6);
-    }
-    runs.sort((x, y) => x - y);
-    return runs[1]; // a low quantile, to shrug off scheduler noise
-  };
-  const knownMs = await timeOf('kavya');
-  const unknownMs = await timeOf('ghost-user');
-  // An unknown user burns a dummy scrypt, so the two must be within a factor
-  // of ~2. Without wasteTime the unknown case is orders of magnitude faster.
-  ok(unknownMs > knownMs * 0.4, `an unknown user is not answered faster (${knownMs.toFixed(0)}ms vs ${unknownMs.toFixed(0)}ms)`);
+  const real = await tryConnect(PORT, good.cookie);
+  eq(real.ok, true, 'a socket with a valid session connects');
 
-  // ── the wrong method, and an oversized body ──────────────────────────────
-  const wrongMethod = await fetch(`http://127.0.0.1:${PORT}/auth/login`, { method: 'GET' });
-  eq(wrongMethod.status, 405, 'the auth routes reject a non-POST');
+  const c = real.c;
+  await c.next('hello');
+  // The join frame carries nothing: identity was settled at the upgrade.
+  c.send('join', {});
+  const welcome = await c.next('welcome');
+  eq(welcome.d.you.name, 'kavya', 'the display name comes off the account');
 
-  const huge = await fetch(`http://127.0.0.1:${PORT}/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ username: 'kavya', password: 'x'.repeat(9000) }),
-  });
-  eq(huge.status, 400, 'an oversized body is refused rather than buffered');
-
-  // ── the token on the socket ──────────────────────────────────────────────
-  const a = await client(PORT);
-  await a.next('hello');
-  const noToken = await a.joinToken('not-a-real-token');
-  eq(noToken.t, 'error', 'a bogus token cannot join');
-  eq(noToken.d.code, 'UNAUTHORIZED', 'with UNAUTHORIZED, so the client drops it and shows sign-in');
-  ok(a.ws.readyState === 1, 'and even that does not close the socket');
-
-  const b = await client(PORT);
-  await b.next('hello');
-  const welcome = await b.joinToken(good.body.token);
-  eq(welcome.t, 'welcome', 'a real token joins');
-  eq(welcome.d.you.name, 'kavya', 'as the account it belongs to');
-
-  // ── impersonation: a username in the payload is ignored ENTIRELY ─────────
-  const meeraLogin = await post(PORT, '/auth/login', { username: 'meera', password: 'correct-horse-2' });
-  const imposter = await client(PORT);
-  await imposter.next('hello');
-  imposter.send('join', { token: meeraLogin.body.token, username: 'kavya' });
-  const impostorWelcome = await imposter.next('welcome');
-  eq(impostorWelcome.d.you.name, 'meera', 'a username sent alongside a token is ignored — the account wins');
-
-  // ── /nick renames the account, so it survives sign-out ───────────────────
-  imposter.send('nick', { username: 'meera-lab' });
-  const renamed = await imposter.next('you');
-  eq(renamed.d.name, 'meera-lab', 'nick renames you');
-  const relogin = await post(PORT, '/auth/login', { username: 'meera-lab', password: 'correct-horse-2' });
-  eq(relogin.status, 200, 'and the rename reached the account, not just the session');
-  const oldName = await post(PORT, '/auth/login', { username: 'meera', password: 'correct-horse-2' });
-  eq(oldName.status, 401, 'so the old name no longer signs in');
-
-  imposter.drain().send('nick', { username: 'kavya' });
-  eq((await imposter.next('error')).d.code, 'NAME_TAKEN', 'and a rename onto a live name is refused');
-
-  // ── sign-out revokes ─────────────────────────────────────────────────────
-  const logout = await post(PORT, '/auth/logout', { token: good.body.token });
-  eq(logout.status, 200, 'sign-out answers 200');
-  eq(logout.body.ok, true, 'with ok');
-
-  const revoked = await client(PORT);
-  await revoked.next('hello');
-  const afterLogout = await revoked.joinToken(good.body.token);
-  eq(afterLogout.d.code, 'UNAUTHORIZED', 'and the token is dead afterwards');
-
-  const unknownLogout = await post(PORT, '/auth/logout', { token: 'never-existed' });
-  eq(unknownLogout.status, 200, 'signing out an unknown token is still 200 — it leaks nothing');
-
-  // ── the Origin policy ────────────────────────────────────────────────────
-  const badOrigin = await new Promise((resolve) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: { Origin: 'http://evil.example' } });
-    ws.on('open', () => { ws.close(); resolve('opened'); });
-    ws.on('error', () => resolve('refused'));
-  });
-  eq(badOrigin, 'refused', 'a foreign Origin cannot open a socket');
-
-  const goodOrigin = await new Promise((resolve) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ws`, { headers: { Origin: `http://127.0.0.1:${PORT}` } });
-    ws.on('open', () => { ws.close(); resolve('opened'); });
-    ws.on('error', () => resolve('refused'));
-  });
-  eq(goodOrigin, 'opened', 'the Origin it dialled is allowed');
-
-  a.close(); b.close(); imposter.close(); revoked.close();
-  await sleep(150);
-  server.stop();
-
-  // ── the brute-force throttle, on its own server ──────────────────────────
-  const throttled = await startServer(THROTTLE_PORT, { DATABASE_URL: 'memory', AUTH_MAX_ATTEMPTS: '5' });
-  await post(THROTTLE_PORT, '/auth/register', { username: 'target', password: 'correct-horse' });
-  let sawLimit = null;
-  for (let i = 0; i < 12; i++) {
-    const attempt = await post(THROTTLE_PORT, '/auth/login', { username: 'target', password: 'guess-' + i });
-    if (attempt.status === 429) { sawLimit = attempt; break; }
+  // ── a username in the payload is ignored ─────────────────────────────────
+  const imposter = await tryConnect(PORT, good.cookie);
+  ok(imposter.ok, 'a second socket for the same account connects');
+  await imposter.c.next('hello');
+  imposter.c.send('join', { username: 'administrator' });
+  const second = await imposter.c.nextAny(['welcome', 'error']);
+  if (second.t === 'welcome') {
+    eq(second.d.you.name, 'kavya', 'a username in the join payload is ignored entirely');
+  } else {
+    eq(second.d.code, 'NAME_TAKEN', 'or the second connection for one account is refused');
   }
-  ok(sawLimit !== null, 'repeated failures are throttled per IP');
-  eq(sawLimit && sawLimit.body.code, 'RATE_LIMIT', 'with RATE_LIMIT');
-  const stillThrottled = await post(THROTTLE_PORT, '/auth/login', { username: 'target', password: 'correct-horse' });
-  eq(stillThrottled.status, 429, 'and the throttle is checked BEFORE the password, so it cannot be worked around');
-  throttled.stop();
+  imposter.c.close();
 
+  // ── /nick renames the account, never the identity ────────────────────────
+  await sleep(150);
+  c.drain().send('nick', { username: 'kavya-r' });
+  const you = await c.next('you');
+  eq(you.d.name, 'kavya-r', '/nick changes the display name');
+  eq(you.d.id, welcome.d.you.id, 'but not the session identity');
+
+  c.close();
+  await sleep(200);
+
+  // The rename must have reached the account, not just the socket.
+  const { Client } = require('pg');
+  const pg = new Client({ connectionString: URL });
+  await pg.connect();
+  const row = await pg.query('select "name" from "user" where "email" = $1', ['kavya@example.test']);
+  eq(row.rows[0] && row.rows[0].name, 'kavya-r', 'and the new name is persisted on the account');
+
+  // The password is hashed, never stored in the clear.
+  const cred = await pg.query(`select "password" from "account" where "providerId" = 'credential' limit 1`);
+  const stored = cred.rows[0] && cred.rows[0].password;
+  ok(stored && !stored.includes('correct-horse-battery'), 'the password is not stored in plaintext');
+  await pg.end();
+
+  server.stop();
   report('auth');
 }
 

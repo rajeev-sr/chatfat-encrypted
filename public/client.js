@@ -17,6 +17,7 @@
 
   var el = {
     join: $('join'), joinForm: $('join-form'), joinName: $('join-name'), joinPw: $('join-pw'),
+    joinNameLabel: $('join-name-label'), joinNameHint: $('join-name-hint'),
     joinPwField: $('join-pw-field'), joinPwRev: $('join-pw-rev'), joinSubmit: $('join-submit'),
     joinSwitch: $('join-switch'), joinSwitchBtn: $('join-switch-btn'), joinSwitchText: $('join-switch-text'),
     joinError: $('join-error'), joinTagline: $('join-tagline'), joinDot: $('join-dot'),
@@ -52,7 +53,7 @@
 
   var state = {
     phase: 'idle', // idle|connecting|joining|lobby|ready|reconnecting|offline
-    ws: null, me: null, wantName: '', token: null,
+    ws: null, me: null, wantName: '',
     auth: false, replays: false, encryption: true,
     authMode: 'login',
     config: { maxText: 2000, maxCiphertext: 12288, emoji: ['👍','❤️','😂','🎉','👀','🔥'],
@@ -77,7 +78,8 @@
     sealed: false, myKeyPair: null, pubs: new Map(), bannerShown: new Set()
   };
 
-  var LS = { theme: 'sb-theme', name: 'sb-name', token: 'sb-token', favs: 'ChatFat-favorites' };
+  // No token key: the session is an HttpOnly cookie the page cannot read.
+  var LS = { theme: 'sb-theme', name: 'sb-name', favs: 'ChatFat-favorites' };
   var UNGUARDED = { hello:1, welcome:1, error:1, rooms:1, 'room:joined':1, 'room:left':1, you:1, ping:1, rtt:1, keys:1 };
   var QUEUEABLE = { chat:1, dm:1, react:1, edit:1, unsend:1, 'poll:new':1, 'poll:vote':1 };
   var PROTOCOL_VERSION = 2;
@@ -178,7 +180,7 @@
   function connect() {
     if (state.ws) { try { state.ws.close(); } catch (e) {} }
     setPhase(state.everJoined ? 'reconnecting' : 'connecting');
-    setJoinStatus(state.token ? 'Resuming your session…' : 'Connecting…', 'warn');
+    setJoinStatus('Connecting…', 'warn');
 
     var ws = new WebSocket(wsUrl());
     state.ws = ws;
@@ -187,7 +189,8 @@
       state.attempt = 0;
       setPhase('joining');
       publishKey();
-      if (state.auth) send('join', { token: state.token });
+      // Identity came from the cookie at the upgrade; join carries nothing.
+      if (state.auth) send('join', {});
       else send('join', { username: state.wantName });
     };
 
@@ -256,9 +259,23 @@
       el.joinSwitchBtn.textContent = state.authMode === 'register' ? 'Sign in' : 'Create one';
       el.joinTagline.textContent = 'This server keeps accounts. Sign in to pick up where you left off.';
       el.joinPw.autocomplete = state.authMode === 'register' ? 'new-password' : 'current-password';
+      // Same input, different meaning: an email address when accounts are on,
+      // a display name when they are off.
+      el.joinNameLabel.textContent = 'Email';
+      el.joinName.type = 'email';
+      el.joinName.autocomplete = 'email';
+      el.joinName.placeholder = 'you@example.com';
+      el.joinName.removeAttribute('maxlength');
+      el.joinNameHint.textContent = 'Used to sign in. Your display name is separate and you can change it later.';
     } else {
       el.joinSubmit.textContent = busy ? 'Connecting…' : 'Connect';
       el.joinTagline.textContent = 'Pick a name and start talking. Nothing here is stored.';
+      el.joinNameLabel.textContent = 'Your name';
+      el.joinName.type = 'text';
+      el.joinName.autocomplete = 'username';
+      el.joinName.placeholder = 'kavya';
+      el.joinName.setAttribute('maxlength', '16');
+      el.joinNameHint.textContent = '2–16 characters. Taken names are refused, so everyone is unambiguous.';
     }
     el.joinSubmit.disabled = busy;
   }
@@ -266,7 +283,6 @@
   async function boot() {
     el.joinUrl.textContent = wsUrl();
     state.wantName = ls(LS.name) || '';
-    state.token = ls(LS.token);
     el.joinName.value = state.wantName;
     readHash();
 
@@ -292,8 +308,18 @@
 
     paintJoinCard();
 
-    // Auth on and a token stored: skip the form entirely.
-    if (state.auth && state.token) { setPhase('connecting'); paintJoinCard(); connect(); }
+    // Ask whether the cookie is still good BEFORE dialling. A rejected upgrade
+    // arrives as a bare 1006 close, indistinguishable from the server being
+    // down, and the reconnect loop would then retry forever behind a form the
+    // user never sees.
+    if (state.auth) {
+      var signedIn = false;
+      try {
+        var s = await fetch('/api/auth/get-session', { credentials: 'same-origin', cache: 'no-store' });
+        signedIn = s.ok && !!(await s.json().catch(function () { return null; }));
+      } catch (e) {}
+      if (signedIn) { setPhase('connecting'); paintJoinCard(); connect(); }
+    }
   }
 
   /* ══ join screen ════════════════════════════════════════════════════════ */
@@ -316,30 +342,50 @@
     event.preventDefault();
     showError(el.joinError, '');
     var name = el.joinName.value.trim();
-    if (!/^[A-Za-z0-9 _.-]{2,16}$/.test(name)) {
-      return showError(el.joinError, 'Names are 2–16 letters, numbers, spaces, _ . or -');
+
+    // Accounts off: the box is a display name, and any free one will do.
+    if (!state.auth) {
+      if (!/^[A-Za-z0-9 _.-]{2,16}$/.test(name)) {
+        return showError(el.joinError, 'Names are 2–16 letters, numbers, spaces, _ . or -');
+      }
+      state.wantName = name;
+      ls(LS.name, name);
+      setPhase('connecting'); paintJoinCard(); connect();
+      return;
     }
-    state.wantName = name;
+
+    // Accounts on: the box is an email address.
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(name)) {
+      return showError(el.joinError, 'Enter your email address.');
+    }
+    if (el.joinPw.value.length < 8) {
+      return showError(el.joinError, 'Passwords are at least 8 characters.');
+    }
     ls(LS.name, name);
-
-    if (!state.auth) { setPhase('connecting'); paintJoinCard(); connect(); return; }
-
     setPhase('connecting');
     paintJoinCard();
+
+    var registering = state.authMode === 'register';
+    var route = registering ? '/api/auth/sign-up/email' : '/api/auth/sign-in/email';
+    var payload = { email: name, password: el.joinPw.value };
+    // Better Auth requires a display name at sign-up; default it to the local
+    // part of the address, which /nick can change afterwards.
+    if (registering) payload.name = name.split('@')[0].slice(0, 16);
+
     try {
-      var res = await fetch('/auth/' + (state.authMode === 'register' ? 'register' : 'login'), {
+      var res = await fetch(route, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ username: name, password: el.joinPw.value })
+        // The session arrives as an HttpOnly cookie. Nothing is stored in JS.
+        credentials: 'same-origin',
+        body: JSON.stringify(payload)
       });
-      var body = await res.json();
       if (!res.ok) {
+        var body = await res.json().catch(function () { return {}; });
         setPhase('idle');
         paintJoinCard();
-        return showError(el.joinError, body.message || 'That did not work.');
+        return showError(el.joinError, body.message || 'That email and password did not work.');
       }
-      state.token = body.token;
-      ls(LS.token, body.token);
       connect();
     } catch (e) {
       setPhase('idle');
@@ -2049,8 +2095,7 @@
     }
     if (d.code === 'UNAUTHORIZED') {
       // The token is worthless. Drop it, close cleanly, show the form. Never retry.
-      state.token = null;
-      ls(LS.token, null);
+      fetch('/api/auth/sign-out', { method: 'POST', credentials: 'same-origin' }).catch(function () {});
       state.phase = 'idle';
       if (state.ws) { try { state.ws.close(1000); } catch (e) {} }
       state.ws = null;

@@ -5,7 +5,6 @@ const os = require('node:os');
 const config = require('./config');
 const log = require('./logger');
 const pool = require('./db/pool');
-const auth = require('./auth');
 const rooms = require('./rooms');
 const history = require('./messages/history');
 const { repository } = require('./messages/repository');
@@ -75,7 +74,6 @@ async function start() {
     // degrade silently into an unauthenticated server.
     try {
       if (config.USE_POSTGRES) await pool.migrate();
-      await auth.store.init();
       await repository.init();
     } catch (err) {
       log.error('DATABASE_URL is set but the store could not be prepared:', err.message);
@@ -126,7 +124,6 @@ function shutdown(signal = 'shutdown') {
   const finish = async () => {
     try {
       await repository.close();
-      await auth.store.close();
       await pool.close();
     } catch (err) {
       log.warn('closing stores:', err.message);

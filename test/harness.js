@@ -106,7 +106,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function client(port, opts = {}) {
   return new Promise((resolve, reject) => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    // `headers` carries the session cookie: since P3 the upgrade is what
+    // authenticates, so a client that cannot send one cannot connect at all.
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, opts.headers ? { headers: opts.headers } : undefined);
     const c = {
       ws,
       frames: [],

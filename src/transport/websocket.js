@@ -103,12 +103,31 @@ function attach(server) {
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    // With accounts on, the session cookie is checked HERE — before the socket
+    // opens — rather than waiting for a `join` frame to carry a token. An
+    // unauthenticated socket never exists.
+    if (config.AUTH_ENABLED) {
+      const { sessionFromHeaders } = require('../auth/betterauth');
+      sessionFromHeaders(req.headers)
+        .then((user) => {
+          if (!user) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req, user));
+        })
+        .catch(() => socket.destroy());
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req, null));
   });
 
-  wss.on('connection', (ws, req) => {
+  wss.on('connection', (ws, req, user) => {
     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
     const session = createSession(ws, ip);
+    session.user = user || null;
 
     // Sent before any join attempt, so the client never has to guess the
     // server's policy.

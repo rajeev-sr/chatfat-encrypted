@@ -24,11 +24,22 @@ const PORT2 = 8088;
 const PORT3 = 8089;
 const URL = process.env.TEST_DATABASE_URL;
 
+// Registers through Better Auth, keeps the session cookie, and dials the
+// socket with it — the upgrade is what authenticates now, not the join frame.
 async function signedIn(port, name, password) {
-  const reg = await post(port, '/auth/register', { username: name, password });
-  const c = await client(port);
+  const res = await fetch(`http://127.0.0.1:${port}/api/auth/sign-up/email`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` },
+    body: JSON.stringify({ email: `${name}@example.test`, password, name }),
+  });
+  if (!res.ok) throw new Error(`sign-up for ${name} failed: ${res.status} ${await res.text()}`);
+  const cookie = (res.headers.getSetCookie ? res.headers.getSetCookie() : [res.headers.get('set-cookie')])
+    .filter(Boolean).map((c) => c.split(';')[0]).join('; ');
+
+  const c = await client(port, { headers: { cookie } });
   await c.next('hello');
-  await c.joinToken(reg.body.token);
+  c.send('join', {});
+  await c.next('welcome');
   return c;
 }
 

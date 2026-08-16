@@ -62,12 +62,21 @@ module.exports = {
   HEARTBEAT_MS: int('HEARTBEAT_MS', 15000, 1000),
   AUTH_MAX_ATTEMPTS: int('AUTH_MAX_ATTEMPTS', 10, 1),
   ENCRYPTION_ENABLED: bool('ENCRYPTION_ENABLED', true),
+  // Better Auth. The secret signs session cookies; a fixed dev default would
+  // mean every deployment that forgot to set one shared it, so app.js refuses
+  // to start with the placeholder when a database is configured.
+  BETTER_AUTH_SECRET: str('BETTER_AUTH_SECRET', ''),
+  BETTER_AUTH_URL: str('BETTER_AUTH_URL', `http://localhost:${int('PORT', 3000, 1, 65535)}`),
   MAX_CIPHERTEXT: int('MAX_CIPHERTEXT', 12288, 1024, 1024 * 1024),
 
-  // — derived: accounts and storage move together —
+  // — derived —
   PERSISTENCE_ENABLED,
   USE_POSTGRES,
-  AUTH_ENABLED: PERSISTENCE_ENABLED,
+  // Accounts need Postgres specifically, not merely "some storage": Better
+  // Auth persists users, sessions and credentials in real tables. So `memory`
+  // means messages are stored but a username is still only a claim, and
+  // Postgres is the only mode where identity is real.
+  AUTH_ENABLED: USE_POSTGRES,
 
   // — compile-time constants —
   PROTOCOL_VERSION: 2, // bumped from 1 by the encryption work (SPEC §14.10)

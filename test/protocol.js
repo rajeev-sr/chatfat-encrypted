@@ -363,7 +363,7 @@ async function main() {
   ok(healthAfter.users >= 3, 'named users are counted');
 
   // ── /auth is off on this server ──────────────────────────────────────────
-  const authOff = await fetch(`http://127.0.0.1:${PORT}/auth/login`, {
+  const authOff = await fetch(`http://127.0.0.1:${PORT}/api/auth/sign-in/email`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
   });
   eq(authOff.status, 404, 'the auth routes are 404 when accounts are off');

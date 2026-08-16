@@ -10,11 +10,12 @@ const { ok, eq, bail, report, startServer, client, sleep, post } = require('./ha
 const PORT = 8097;
 const OFF_PORT = 8095;
 
-async function signedIn(port, name, password) {
-  const reg = await post(port, '/auth/register', { username: name, password });
+// `memory` mode stores messages but keeps accounts off — Better Auth needs
+// real tables — so a client here just claims a free name.
+async function signedIn(port, name) {
   const c = await client(port);
   await c.next('hello');
-  await c.joinToken(reg.body.token);
+  await c.join(name);
   return c;
 }
 
