@@ -170,8 +170,10 @@ test/
 tools/
   loadtest.js              broadcast fan-out latency as room size grows
 docs/
-  SPEC.md                  the full product and engineering specification
-  design.html              the design document, linked to the live stylesheet
+  ROADMAP.md               the twelve-phase Lab 4 plan + compliance matrix
+  progress.md              per-phase status; the tracker that says how far
+  CONTRIBUTIONS.md         per-member contribution report
+  DESIGN-SYSTEM.md         colour, type, space, motion tokens + contrast audit
 ```
 
 Two rules hold the module graph together: `config.js` is the only module that reads

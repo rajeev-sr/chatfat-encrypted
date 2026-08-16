@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A second push to the same branch cancels the first — a queue of stale runs
+# helps nobody.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test · node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # `npm ci` needs a lockfile in sync with package.json. If this step is
+      # what broke, the fix is committing the lockfile, not loosening the step.
+      - run: npm ci
+
+      # Every suite spawns a real server and drives it with real WebSocket
+      # clients. ChatFat_ENV_FILE=off keeps a developer's .env out of CI.
+      - name: protocol
+        run: npm test
+        env:
+          ChatFat_ENV_FILE: off
+
+      - name: auth
+        run: npm run test:auth
+        env:
+          ChatFat_ENV_FILE: off
+
+      - name: persistence
+        run: npm run test:persistence
+        env:
+          ChatFat_ENV_FILE: off
+
+      - name: crypto
+        run: npm run test:crypto
+        env:
+          ChatFat_ENV_FILE: off
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      # Advisory: a transitive moderate should not block a lab submission, but
+      # it should be visible in the log.
+      - run: npm audit --audit-level=high
+
+  secrets:
+    name: no secrets committed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The three credentials this project handles. .env is gitignored; this
+      # catches the day somebody force-adds it or pastes a key into a source
+      # file. .env.example is excluded — it holds only placeholders.
+      - name: grep for credential shapes
+        run: |
+          set +e
+          FOUND=0
+          check() {
+            # shellcheck disable=SC2086
+            MATCH=$(grep -rInE "$1" \
+              --exclude-dir=node_modules --exclude-dir=.git \
+              --exclude=.env.example --exclude=ci.yml \
+              . 2>/dev/null)
+            if [ -n "$MATCH" ]; then
+              echo "::error::possible $2 committed"
+              echo "$MATCH"
+              FOUND=1
+            fi
+          }
+          check 'postgresql://[^ "'"'"']*:[^ "'"'"']*@[^ "'"'"']*neon\.tech' 'Neon connection string'
+          check '[0-9]{10,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com' 'Google OAuth client id'
+          check 'GOCSPX-[A-Za-z0-9_-]{20,}' 'Google OAuth client secret'
+          exit $FOUND
