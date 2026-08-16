@@ -2245,5 +2245,99 @@
     if (state.phase === 'ready') send('presence', { state: document.hidden ? 'away' : 'active' });
   });
 
+  // Aesthetics & subtle frontend polish (non-invasive)
+  ;(function () {
+    try {
+      var css = `
+/* ChatFat - small aesthetic polish injected by client.js */
+/* Toasts */
+.cf-toast { opacity: 0; transform: translateY(8px); transition: opacity .28s ease, transform .28s ease, box-shadow .28s ease; border-radius: 8px; padding: 10px 12px; margin: 6px 0; display: inline-block; background: var(--bg); box-shadow: 0 6px 18px rgba(12,20,30,0.06); border: 1px solid rgba(0,0,0,0.04); }
+.cf-toast.bad { background: linear-gradient(90deg, rgba(255,240,240,0.98), rgba(255,245,245,0.98)); border-color: rgba(220,40,40,0.12); }
+.cf-toast .code { margin-left: 10px; opacity: .85; font-weight: 600; }
+.cf-toast.cf-toast-show { opacity: 1; transform: none; }
+
+/* Message entry animation */
+.cf-msg { transition: transform .32s cubic-bezier(.2,.9,.2,1), opacity .28s ease; }
+.cf-msg.incoming { transform: translateY(8px); opacity: 0; }
+.cf-msg.incoming.play { transform: none; opacity: 1; }
+
+/* Avatar hover */
+.gutter .av, .cf-user .av { transition: box-shadow .26s ease, transform .2s ease; border-radius: 6px; }
+.gutter .av:hover, .cf-user .av:hover { transform: translateY(-3px); box-shadow: 0 12px 30px rgba(9,18,30,0.08); }
+
+/* Composer and buttons */
+.cf-btn, .cf-ac-row button { transition: transform .12s ease, box-shadow .12s ease; }
+.cf-btn:hover { transform: translateY(-1px); }
+
+/* Counter */
+#count { transition: color .18s ease, transform .18s ease; }
+#count.over { color: var(--danger, #c33); transform: scale(1.03); }
+
+/* Small pill transition */
+.cf-pill { transition: background-color .2s ease, color .2s ease, box-shadow .2s ease; }
+
+/* Subtle scrollbar for modern browsers */
+.el-log-scroll::-webkit-scrollbar, .cf-log::-webkit-scrollbar { height: 10px; width: 10px; }
+.el-log-scroll::-webkit-scrollbar-thumb, .cf-log::-webkit-scrollbar-thumb { background: rgba(0,0,0,0.08); border-radius: 10px; }
+`;
+      var style = document.createElement('style');
+      style.setAttribute('data-chatfat-aesthetic', '1');
+      style.textContent = css;
+      (document.head || document.documentElement).appendChild(style);
+
+      // Animate newly added toasts and message rows
+      var logEl = el.log || document.getElementById('log');
+      var toastsEl = el.toasts || document.getElementById('toasts');
+      if (toastsEl) {
+        new MutationObserver(function (records) {
+          records.forEach(function (rec) {
+            rec.addedNodes && rec.addedNodes.forEach(function (n) {
+              if (n.nodeType !== 1) return;
+              if (n.classList.contains('cf-toast')) {
+                // trigger css transition
+                requestAnimationFrame(function () { n.classList.add('cf-toast-show'); });
+                // make clickable to dismiss quickly
+                n.style.cursor = 'pointer';
+              }
+            });
+          });
+        }).observe(toastsEl, { childList: true });
+
+        toastsEl.addEventListener('click', function (ev) {
+          var t = ev.target.closest && ev.target.closest('.cf-toast');
+          if (t && t.parentNode) t.parentNode.removeChild(t);
+        });
+      }
+
+      if (logEl) {
+        // When a message is inserted, add an incoming class then play the animation
+        var msgObserver = new MutationObserver(function (records) {
+          records.forEach(function (rec) {
+            rec.addedNodes && rec.addedNodes.forEach(function (n) {
+              if (n.nodeType !== 1) return;
+              if (n.classList && n.classList.contains('cf-msg')) {
+                n.classList.add('incoming');
+                // play in next frame to allow transition from starting state
+                requestAnimationFrame(function () { n.classList.add('play'); });
+                // clean up after animation
+                setTimeout(function () { n.classList.remove('incoming'); n.classList.remove('play'); }, 800);
+              }
+              // also animate polls/cards consistently
+              if (n.classList && (n.classList.contains('cf-poll') || n.classList.contains('cf-sys'))) {
+                n.style.opacity = '0';
+                requestAnimationFrame(function () { n.style.transition = 'opacity .32s ease'; n.style.opacity = '1'; });
+              }
+            });
+          });
+        });
+        msgObserver.observe(logEl, { childList: true });
+      }
+
+      // Gentle accessibility tweak: expose remaining chars via aria-live on the count
+      try { var ct = el.count; if (ct) ct.setAttribute('aria-live', 'polite'); } catch (e) {}
+
+    } catch (e) { /* never break the main app for the enhancements */ }
+  })();
+
   boot();
 })();
