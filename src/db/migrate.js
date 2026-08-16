@@ -73,14 +73,35 @@ async function applied(client) {
   return new Map(res.rows.map((r) => [r.version, r]));
 }
 
+// The whole set runs inside ONE transaction, holding ONE transaction-scoped
+// advisory lock.
+//
+// The obvious implementation — pg_advisory_lock at the start, pg_advisory_unlock
+// in a finally — is wrong here, in a way that only shows up in production. Two
+// reasons, either of which is fatal:
+//
+//   1. A session-level advisory lock outlives a crashed client. The lock is
+//      released when the SESSION ends, and a process killed with SIGKILL leaves
+//      its session alive on the server until a TCP timeout notices. Every
+//      subsequent boot then blocks forever on a lock nobody holds. This is not
+//      hypothetical — it wedged this project's own test suite.
+//   2. Neon's POOLED endpoint is PgBouncer in transaction pooling mode, where a
+//      client does not keep the same backend between statements. A session lock
+//      taken on one backend and unlocked on another is not a lock at all.
+//
+// pg_advisory_xact_lock fixes both: the server releases it at commit or
+// rollback, whatever happens to the client, and it is safe under transaction
+// pooling because it lives and dies inside a single transaction.
 async function run() {
   const migrations = load();
   const client = await pool.getPool().connect();
 
   try {
-    // Serialise concurrent boots. Released automatically when the session ends,
-    // so a crashed process cannot wedge the lock permanently.
-    await client.query('select pg_advisory_lock($1)', [String(LOCK_ID)]);
+    await client.query('begin');
+    // A lock that cannot be acquired must fail loudly rather than hang a boot
+    // for ever. Ten seconds is far longer than any honest contender needs.
+    await client.query("set local lock_timeout = '10s'");
+    await client.query('select pg_advisory_xact_lock($1)', [String(LOCK_ID)]);
     await client.query(VERSION_TABLE);
 
     const done = await applied(client);
@@ -102,7 +123,6 @@ async function run() {
         continue;
       }
 
-      await client.query('begin');
       try {
         await client.query(m.sql);
         await client.query('insert into schema_version (version, name, checksum) values ($1,$2,$3)', [
@@ -110,9 +130,7 @@ async function run() {
           m.name,
           m.checksum,
         ]);
-        await client.query('commit');
       } catch (err) {
-        await client.query('rollback').catch(() => {});
         throw new Error(`migration ${m.name} failed: ${err.message}`);
       }
 
@@ -120,11 +138,21 @@ async function run() {
       ran++;
     }
 
+    await client.query('commit');
+
     const head = migrations.length ? migrations[migrations.length - 1].version : 0;
     log.info(ran ? `schema at version ${head} (${ran} applied)` : `schema already at version ${head}`);
     return { head, ran };
+  } catch (err) {
+    await client.query('rollback').catch(() => {});
+    if (err.code === '55P03' || /lock_timeout|canceling statement/i.test(err.message)) {
+      throw new Error(
+        'could not take the migration lock within 10s — another server may be migrating, ' +
+          'or a previous one died mid-migration. Retry; if it persists, check pg_locks.',
+      );
+    }
+    throw err;
   } finally {
-    await client.query('select pg_advisory_unlock($1)', [String(LOCK_ID)]).catch(() => {});
     client.release();
   }
 }

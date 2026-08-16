@@ -54,6 +54,7 @@ function welcome(session) {
       maxBurn: config.MAX_BURN_S,
       editWindow: config.EDIT_WINDOW_MS,
       historyReplay: config.HISTORY_REPLAY,
+      historyPage: config.HISTORY_PAGE,
       maxRooms: config.MAX_ROOMS,
       encryption: config.ENCRYPTION_ENABLED,
       kdfIterations: 250000,
@@ -320,6 +321,52 @@ async function onChat(session, d) {
   detach(repository.save(room.id, message), 'a message');
 }
 
+// — history —
+
+// Scrollback. The client sends the (ts, id) of the oldest message it holds and
+// gets the page strictly before it. Both `done` and an empty array are needed:
+// an empty page means "nothing more", but the client must also be able to tell
+// a server that does not replay from a room that is simply quiet.
+async function onHistoryMore(session, d) {
+  const room = hub.rooms.get(session.room);
+  if (!room) return fail(session.ws, 'NOT_FOUND', 'You are not in a room.');
+  if (!config.HISTORY_REPLAY) return fail(session.ws, 'FORBIDDEN', 'This server does not replay history.');
+  // Same bucket as chat: a scroll loop must not become a way to hammer the
+  // database from a single socket.
+  if (!takeToken(session)) return fail(session.ws, 'RATE_LIMIT', 'Slow down a moment.');
+
+  const limit = Math.min(Math.max(Number(d && d.limit) || config.HISTORY_PAGE, 1), config.HISTORY_PAGE);
+
+  let cursor = null;
+  if (d && d.before && typeof d.before === 'object') {
+    const ts = Number(d.before.ts);
+    const id = d.before.id;
+    // A malformed cursor is refused rather than silently treated as "from the
+    // top" — that would hand back the newest page and look like a duplicate.
+    if (!Number.isFinite(ts) || typeof id !== 'string' || !id) {
+      return fail(session.ws, 'NAME_INVALID', 'Malformed history cursor.');
+    }
+    cursor = { ts, id };
+  }
+
+  let page;
+  try {
+    page = await repository.before(room.id, cursor, limit);
+  } catch (err) {
+    log.warn('history page failed:', err.message);
+    return fail(session.ws, 'UNAVAILABLE', 'Could not load earlier messages.');
+  }
+  // The socket may have closed, or the user may have changed rooms, while we
+  // were away at the database.
+  if (!alive(session) || session.room !== room.id) return;
+
+  send(session.ws, 'history:page', {
+    room: room.id,
+    messages: page,
+    done: page.length < limit,
+  });
+}
+
 async function onDm(session, d) {
   if (!takeToken(session)) return fail(session.ws, 'RATE_LIMIT', 'Slow down a moment.');
 
@@ -564,6 +611,7 @@ module.exports = {
   'room:leave': onRoomLeave,
   'room:lock': onRoomLock,
   chat: onChat,
+  'history:more': onHistoryMore,
   dm: onDm,
   typing: onTyping,
   react: onReact,

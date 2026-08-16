@@ -19,6 +19,7 @@
     "loadtest": "node tools/loadtest.js"
   },
   "dependencies": {
+    "better-auth": "^1.6.29",
     "ws": "^8.18.0"
   },
   "optionalDependencies": {

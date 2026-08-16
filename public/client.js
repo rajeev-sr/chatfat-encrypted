@@ -56,7 +56,12 @@
     auth: false, replays: false, encryption: true,
     authMode: 'login',
     config: { maxText: 2000, maxCiphertext: 12288, emoji: ['👍','❤️','😂','🎉','👀','🔥'],
-              minBurn: 5, maxBurn: 300, editWindow: 300000, kdfIterations: 250000 },
+              minBurn: 5, maxBurn: 300, editWindow: 300000, kdfIterations: 250000,
+              historyPage: 50 },
+    // Scrollback. `oldest` is the (ts, id) cursor of the topmost loaded
+    // message; `done` starts true so a server that replays nothing never asks
+    // for a page it will not be given.
+    hist: { oldest: null, done: true, loading: false, error: false },
     room: null, roomMeta: null, wantRoom: null, pendingRoomHash: null,
     rooms: [], roster: [], typing: [],
     msgs: new Map(), polls: new Map(),
@@ -668,7 +673,88 @@
     state.lastDay = null;
     state.unread = 0;
     el.jump.hidden = true;
+    state.hist = { oldest: null, done: true, loading: false, error: false };
   }
+
+  // ══ scrollback ══════════════════════════════════════════════════════════
+  // Prepending is not appending in reverse. Two things have to be handled that
+  // the append path never sees: the scroll position, which must not move under
+  // the reader's hands, and the day separators, whose correctness depends on
+  // what comes BEFORE each message — and a prepend changes that for the first
+  // message already on screen.
+
+  // Removed and rebuilt wholesale rather than patched. A prepended page can
+  // invalidate the separator above the previously-oldest message, and an
+  // incremental fix has more cases than the whole rebuild has cost: the log
+  // holds a few hundred nodes, not a few hundred thousand.
+  function rebuildDays() {
+    var stale = el.log.querySelectorAll('.cf-day');
+    for (var i = 0; i < stale.length; i++) stale[i].remove();
+
+    var seen = null;
+    var nodes = el.log.querySelectorAll('[data-ts]');
+    for (var j = 0; j < nodes.length; j++) {
+      var label = dayLabel(Number(nodes[j].getAttribute('data-ts')));
+      if (label === seen) continue;
+      seen = label;
+      var div = document.createElement('div');
+      div.className = 'cf-day';
+      div.textContent = label;
+      nodes[j].parentNode.insertBefore(div, nodes[j]);
+    }
+    // The append path picks up from wherever the rebuild left off, so the next
+    // live message does not re-emit a separator for the day already shown.
+    state.lastDay = seen;
+  }
+
+  function historyTop() {
+    var bar = document.getElementById('cf-histtop');
+    if (bar) return bar;
+    bar = document.createElement('div');
+    bar.id = 'cf-histtop';
+    bar.className = 'cf-histtop';
+    el.log.insertBefore(bar, el.log.firstChild);
+    return bar;
+  }
+
+  function paintHistoryTop() {
+    var h = state.hist;
+    var bar = historyTop();
+    if (h.loading) {
+      bar.className = 'cf-histtop loading';
+      bar.textContent = 'Loading earlier messages…';
+      bar.hidden = false;
+    } else if (h.error) {
+      bar.className = 'cf-histtop error';
+      bar.textContent = '';
+      var retry = document.createElement('button');
+      retry.type = 'button';
+      retry.textContent = 'Could not load earlier messages — retry';
+      retry.addEventListener('click', function () { state.hist.error = false; loadOlder(); });
+      bar.appendChild(retry);
+      bar.hidden = false;
+    } else if (h.done && state.msgs.size) {
+      bar.className = 'cf-histtop done';
+      bar.textContent = 'Beginning of this room';
+      bar.hidden = false;
+    } else {
+      bar.hidden = true;
+    }
+  }
+
+  function loadOlder() {
+    var h = state.hist;
+    if (!state.room || h.loading || h.done || h.error) return;
+    h.loading = true;
+    paintHistoryTop();
+    send('history:more', { before: h.oldest, limit: state.config.historyPage || 50 });
+  }
+
+  el.log.addEventListener('scroll', function () {
+    // 240px of runway, so the page is already arriving by the time the reader
+    // reaches the top rather than after they hit it and wait.
+    if (el.log.scrollTop < 240) loadOlder();
+  });
 
   function systemLine(text, kind, user, colour) {
     var div = document.createElement('div');
@@ -801,6 +887,9 @@
     var row = document.createElement('div');
     row.className = 'cf-msg';
     row.style.setProperty('--uc', data.colour);
+    // Read by rebuildDays(), which needs each row's timestamp without having to
+    // look the message back up in state.msgs.
+    row.setAttribute('data-ts', String(data.ts));
 
     var text = plain ? plain.text : data.text;
     var mentions = plain ? (plain.mentions || []) : (data.mentions || []);
@@ -910,7 +999,7 @@
     return row;
   }
 
-  function renderMessage(data, plain) {
+  function renderMessage(data, plain, atTop) {
     var existing = state.msgs.get(data.id);
     if (existing && existing.node.parentNode) {
       var replacement = buildMessage(data, existing.plain, existing.grouped);
@@ -919,6 +1008,18 @@
       existing.node = replacement;
       return replacement;
     }
+    // A prepended message is never grouped with the one after it and never
+    // counts as unread — it is older than everything on screen, and the reader
+    // asked for it. It also must not advance state.last, which tracks the
+    // NEWEST message for grouping the next live one.
+    if (atTop) {
+      var oldNode = buildMessage(data, plain, false);
+      state.msgs.set(data.id, { data: data, node: oldNode, plain: plain, grouped: false });
+      var anchor = document.getElementById('cf-histtop');
+      el.log.insertBefore(oldNode, anchor ? anchor.nextSibling : el.log.firstChild);
+      return oldNode;
+    }
+
     maybeDay(data.ts);
     var isGrouped = grouped(data);
     var node = buildMessage(data, plain, isGrouped);
@@ -1727,14 +1828,55 @@
         if (d.history === undefined) {
           systemLine('You see what is said from here on — this server replays nothing.', '');
         } else if (d.history.length === 0) {
-          systemLine('Nothing has been said in here recently.', '');
+          // Absent and empty are different states and the product says so: a
+          // server that does not replay, versus a room nobody has used.
+          systemLine('Nothing has been said in here yet.', '');
+          state.hist.done = true;
         } else {
           for (var i = 0; i < d.history.length; i++) {
             renderMessage(d.history[i], d.history[i].enc ? undefined : null);
             if (d.history[i].enc) decryptInto(d.history[i].id);
           }
+          // A full first page means there is probably more behind it; a short
+          // one means we already have the whole room.
+          state.hist.oldest = { ts: d.history[0].ts, id: d.history[0].id };
+          state.hist.done = d.history.length < (state.config.historyReplay || d.history.length);
         }
+        paintHistoryTop();
         el.log.scrollTop = el.log.scrollHeight;
+        return;
+      }
+
+      case 'history:page': {
+        // Ignore a page that arrived after the reader moved on.
+        if (d.room !== state.room) return;
+        state.hist.loading = false;
+        state.hist.error = false;
+        if (d.done) state.hist.done = true;
+
+        if (d.messages && d.messages.length) {
+          // The anchor. Everything between these two lines changes the
+          // document's height above the viewport, and without restoring the
+          // delta the reader is thrown backwards by exactly one page — the
+          // classic scrollback bug.
+          var beforeH = el.log.scrollHeight;
+          var beforeTop = el.log.scrollTop;
+
+          // Reverse order: each message is inserted directly under the loading
+          // bar, so inserting oldest-last leaves them in ascending order.
+          for (var j = d.messages.length - 1; j >= 0; j--) {
+            var m = d.messages[j];
+            renderMessage(m, m.enc ? undefined : null, true);
+            if (m.enc) decryptInto(m.id);
+          }
+          state.hist.oldest = { ts: d.messages[0].ts, id: d.messages[0].id };
+          rebuildDays();
+
+          paintHistoryTop();
+          el.log.scrollTop = beforeTop + (el.log.scrollHeight - beforeH);
+        } else {
+          paintHistoryTop();
+        }
         return;
       }
 
@@ -1896,6 +2038,15 @@
   }
 
   function onError(d) {
+    // A refused history page must clear the in-flight flag, or the scroll
+    // listener sees loading:true forever and scrollback dies silently. The
+    // retry is offered in the bar rather than fired automatically — an
+    // automatic retry against a rate limit is how you earn a longer one.
+    if (state.hist && state.hist.loading) {
+      state.hist.loading = false;
+      state.hist.error = true;
+      paintHistoryTop();
+    }
     if (d.code === 'UNAUTHORIZED') {
       // The token is worthless. Drop it, close cleanly, show the form. Never retry.
       state.token = null;

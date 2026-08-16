@@ -20,6 +20,8 @@
 const { ok, eq, bail, report, startServer, client, sleep, post } = require('./harness');
 
 const PORT = 8087;
+const PORT2 = 8088;
+const PORT3 = 8089;
 const URL = process.env.TEST_DATABASE_URL;
 
 async function signedIn(port, name, password) {
@@ -28,6 +30,27 @@ async function signedIn(port, name, password) {
   await c.next('hello');
   await c.joinToken(reg.body.token);
   return c;
+}
+
+// Poll until `want` rows are visible in the room, or give up. Writes are
+// detached from the request path, so the only honest way to know a message is
+// stored is to look.
+async function waitForRows(roomId, want, timeoutMs) {
+  const { Client } = require('pg');
+  const deadline = Date.now() + timeoutMs;
+  let n = -1;
+  for (;;) {
+    const c = new Client({ connectionString: URL });
+    await c.connect();
+    try {
+      const r = await c.query('select count(*)::int n from messages where room_id = $1', [roomId]);
+      n = r.rows[0].n;
+    } finally {
+      await c.end().catch(() => {});
+    }
+    if (n >= want || Date.now() > deadline) return n;
+    await sleep(300);
+  }
 }
 
 // Every run starts from an empty schema, so a previous run's rows cannot make
@@ -78,11 +101,17 @@ async function main() {
   a.close();
   await sleep(200);
   first.stop();
-  await sleep(600); // let the port free up
+  await sleep(1200);
 
   // ── second boot: the messages are still there ────────────────────────────
   // This is the assertion the whole phase exists for.
-  const second = await startServer(PORT, {
+  //
+  // A DIFFERENT port on purpose. The harness kills with SIGKILL, and a socket
+  // in TIME_WAIT then makes the rebind racy — which would show up as an
+  // intermittent failure of the persistence claim, the one assertion that must
+  // never be doubted. Durability is a property of the database, not of the
+  // port, so nothing is weakened by moving it.
+  const second = await startServer(PORT2, {
     DATABASE_URL: URL,
     HISTORY_REPLAY: '50',
     AUTH_MAX_ATTEMPTS: '500',
@@ -91,7 +120,7 @@ async function main() {
   ok(!second.out().includes('migration applied'), 'a second boot applies no migrations');
   ok(second.out().includes('schema already at version'), 'and says the schema is already current');
 
-  const b = await signedIn(PORT, 'meera', 'correct-horse-2');
+  const b = await signedIn(PORT2, 'meera', 'correct-horse-2');
   const joined = await b.enter('durable');
 
   ok(Array.isArray(joined.d.history), 'history is replayed after a restart');
@@ -104,9 +133,69 @@ async function main() {
   // Losing the directory while keeping the messages would orphan every row.
   eq(joined.d.room.id, 'durable', 'the room created before the restart still exists');
 
+  // ── keyset pagination against real SQL ───────────────────────────────────
+  // The `(ts, id) < ($2, $3)` row comparison is Postgres-specific and the
+  // memory repository proves nothing about it, so it gets its own pass here.
+  b.drain();
+  const TOTAL = 12;
+  for (let i = 0; i < TOTAL; i++) {
+    b.send('chat', { text: 'p' + i });
+    await b.next('chat');
+  }
+
+  // Wait for DURABILITY, not for the echo. Writes are detached from the hot
+  // path on purpose — a slow database must not delay the room — so a message
+  // being broadcast says nothing about whether it has landed. A fixed sleep
+  // here is a guess that fails the moment the database is further away than
+  // the developer's laptop; against Neon in another region, twelve sequential
+  // inserts comfortably outlast half a second, and the suite then "finds" a
+  // pagination bug that does not exist.
+  const durable = await waitForRows('durable', TOTAL + 1, 20000);
+  eq(durable, TOTAL + 1, 'every message reached the database before the read');
+
   b.close();
   await sleep(200);
   second.stop();
+  await sleep(1200);
+
+  // A third boot against the same database, this time replaying a short page,
+  // so the paging loop is actually exercised rather than served everything at
+  // once. It also demonstrates a second instance reading one Neon database.
+  const third = await startServer(PORT3, {
+    DATABASE_URL: URL,
+    HISTORY_REPLAY: '5',
+    HISTORY_PAGE: '5',
+    AUTH_MAX_ATTEMPTS: '500',
+  });
+
+  const c = await signedIn(PORT3, 'aravind', 'correct-horse-3');
+  const screen = await c.enter('durable');
+  eq(screen.d.history.length, 5, 'the first screen is one page');
+
+  const seen = screen.d.history.map((m) => m.text);
+  let cursor = { ts: screen.d.history[0].ts, id: screen.d.history[0].id };
+  let pages = 0;
+
+  for (let guard = 0; guard < 8; guard++) {
+    c.drain().send('history:more', { before: cursor, limit: 5 });
+    const page = (await c.next('history:page')).d;
+    pages++;
+    seen.unshift(...page.messages.map((m) => m.text));
+    if (page.done) break;
+    cursor = { ts: page.messages[0].ts, id: page.messages[0].id };
+  }
+
+  const paged = seen.filter((t) => /^p\d+$/.test(t));
+  eq(paged.length, TOTAL, 'keyset pagination returns every row exactly once on postgres');
+  eq(new Set(paged).size, TOTAL, 'with no duplicate at any page boundary');
+  eq(paged.join(','), Array.from({ length: TOTAL }, (_, i) => 'p' + i).join(','),
+     'and the reassembled pages are in order');
+  ok(pages >= 2, 'and it took more than one page to get there');
+  ok(seen[0] === 'written before the restart', 'paging reaches the very first message in the room');
+
+  c.close();
+  await sleep(200);
+  third.stop();
 
   report('postgres');
 }

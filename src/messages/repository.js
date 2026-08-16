@@ -11,6 +11,19 @@ const config = require('../config');
 const log = require('../logger');
 const pool = require('../db/pool');
 
+// Ordering is (ts, id), never ts alone. Two messages can share a millisecond —
+// a burst of three from the same client routinely does — and a cursor that
+// cannot break that tie will either skip a row or hand it back twice on the
+// next page. `id` is monotonic within a millisecond because newId appends a
+// counter, so it is a valid tie-break.
+function byTsThenId(a, b) {
+  return a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+function olderThan(m, cursor) {
+  return m.ts < cursor.ts || (m.ts === cursor.ts && m.id < cursor.id);
+}
+
 function encColumns(m) {
   const e = m.enc;
   return e
@@ -54,6 +67,9 @@ class NullRepo {
   async recent() {
     return [];
   }
+  async before() {
+    return [];
+  }
   async close() {}
 }
 
@@ -85,7 +101,21 @@ class MemoryRepo {
     for (const { roomId: rid, m } of this.rows.values()) {
       if (rid === roomId && !m.unsent) out.push(m); // unsent rows are excluded from replay
     }
-    out.sort((a, b) => a.ts - b.ts);
+    out.sort(byTsThenId);
+    return out.slice(-limit).map((m) => JSON.parse(JSON.stringify(m)));
+  }
+
+  // The page strictly older than the cursor. Same ordering rule as recent(),
+  // and the same tie-break on id — see the comment on byTsThenId.
+  async before(roomId, cursor, limit) {
+    if (limit <= 0) return [];
+    const out = [];
+    for (const { roomId: rid, m } of this.rows.values()) {
+      if (rid !== roomId || m.unsent) continue;
+      if (cursor && !olderThan(m, cursor)) continue;
+      out.push(m);
+    }
+    out.sort(byTsThenId);
     return out.slice(-limit).map((m) => JSON.parse(JSON.stringify(m)));
   }
 
@@ -163,9 +193,29 @@ class PgRepo {
     if (limit <= 0) return [];
     const res = await pool.query(
       `select * from (
-         select * from messages where room_id = $1 and unsent = false order by ts desc limit $2
-       ) t order by ts asc`,
+         select * from messages where room_id = $1 and unsent = false
+         order by ts desc, id desc limit $2
+       ) t order by ts asc, id asc`,
       [roomId, limit],
+    );
+    return res.rows.map(rowToMessage);
+  }
+
+  // Keyset pagination, never OFFSET. On Neon every page is a network round
+  // trip, and OFFSET makes the database walk and discard every row it skips —
+  // so page 20 costs twenty times page 1, for identical output. The row
+  // comparison `(ts, id) < ($2, $3)` matches the messages_room_ts index
+  // exactly, so each page is one index seek regardless of depth.
+  async before(roomId, cursor, limit) {
+    if (limit <= 0) return [];
+    if (!cursor) return this.recent(roomId, limit);
+    const res = await pool.query(
+      `select * from (
+         select * from messages
+         where room_id = $1 and unsent = false and (ts, id) < ($2, $3)
+         order by ts desc, id desc limit $4
+       ) t order by ts asc, id asc`,
+      [roomId, cursor.ts, cursor.id, limit],
     );
     return res.rows.map(rowToMessage);
   }

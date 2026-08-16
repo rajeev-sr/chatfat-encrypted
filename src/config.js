@@ -56,6 +56,8 @@ module.exports = {
   // 0 meant the shipped configuration did not satisfy it.
   HISTORY_REPLAY: int('HISTORY_REPLAY', 50, 0, 200),
   HISTORY_CAP: int('HISTORY_CAP', 200, 10, 5000),
+  // One scrollback page. Also the ceiling: a client asking for more gets this.
+  HISTORY_PAGE: int('HISTORY_PAGE', 50, 1, 200),
   MAX_ROOMS: int('MAX_ROOMS', 24, 1, 500),
   HEARTBEAT_MS: int('HEARTBEAT_MS', 15000, 1000),
   AUTH_MAX_ATTEMPTS: int('AUTH_MAX_ATTEMPTS', 10, 1),
@@ -84,8 +86,12 @@ module.exports = {
   MAX_BURN_S: 300,
   TYPING_TTL_MS: 4000,
   UNNAMED_GRACE_MS: 30000,
-  BUCKET_SIZE: 5,
-  BUCKET_REFILL_MS: 1000,
+  // Configurable rather than constant: the same bucket now governs scrollback
+  // pages as well as chat, and both the pagination suite and the load tool
+  // need to exercise volumes a human never produces. The defaults are
+  // unchanged — burst 5, then one per second.
+  BUCKET_SIZE: int('BUCKET_SIZE', 5, 1, 10000),
+  BUCKET_REFILL_MS: int('BUCKET_REFILL_MS', 1000, 1, 60000),
   AUTH_WINDOW_MS: 60000,
   SESSION_TTL_MS: 7 * 24 * 60 * 60 * 1000,
   MIN_PASSWORD: 8,

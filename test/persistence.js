@@ -142,6 +142,64 @@ async function main() {
   await sleep(150);
   off.stop();
 
+  // ── scrollback: keyset pagination ────────────────────────────────────────
+  // The page boundary is where an off-by-one shows up, so this walks a room
+  // whose message count is not a multiple of the page size and checks that
+  // every message is seen exactly once.
+  const pgs = await startServer(8091, {
+    DATABASE_URL: 'memory',
+    HISTORY_REPLAY: '5',
+    HISTORY_PAGE: '5',
+    AUTH_MAX_ATTEMPTS: '500',
+    BUCKET_SIZE: '400',
+  });
+  const w = await signedIn(8091, 'writer', 'correct-horse');
+  await w.create('deep');
+  const TOTAL = 12;
+  for (let i = 0; i < TOTAL; i++) {
+    w.send('chat', { text: 'm' + i });
+    await w.next('chat');
+  }
+  await sleep(400);
+
+  const r = await signedIn(8091, 'reader', 'correct-horse-2');
+  const top = await r.enter('deep');
+  eq(top.d.history.length, 5, 'the first screen is one page');
+  eq(top.d.history[4].text, 'm11', 'showing the newest messages');
+
+  const seen = top.d.history.map((m) => m.text);
+  let cursor = { ts: top.d.history[0].ts, id: top.d.history[0].id };
+  let pages = 0;
+  for (;;) {
+    r.drain().send('history:more', { before: cursor, limit: 5 });
+    const page = (await r.next('history:page')).d;
+    pages++;
+    // Spread, not a loop of unshift — unshifting one at a time reverses the
+    // page, which then reads as a product bug that is not there.
+    seen.unshift(...page.messages.map((m) => m.text));
+    if (page.done) break;
+    cursor = { ts: page.messages[0].ts, id: page.messages[0].id };
+    if (pages > 6) break; // a pagination bug must fail the test, not hang it
+  }
+  eq(pages, 2, '12 messages at 5 a page is two more pages');
+  eq(seen.length, TOTAL, 'every message is delivered exactly once across the pages');
+  eq(new Set(seen).size, TOTAL, 'with no duplicates at the page boundary');
+  // The strongest statement available: not just that every message arrived,
+  // but that reassembling the pages reproduces the room exactly.
+  const expected = Array.from({ length: TOTAL }, (_, i) => 'm' + i);
+  eq(seen.join(','), expected.join(','), 'the reassembled pages reproduce the room in order');
+
+  // A cursor the server cannot parse is refused, never silently treated as
+  // "from the top" — that would hand back the newest page and read as a
+  // duplicate rather than as an error.
+  r.drain().send('history:more', { before: { ts: 'not-a-number', id: 'x' } });
+  const badCursor = await r.next('error');
+  eq(badCursor.d.code, 'NAME_INVALID', 'a malformed history cursor is refused');
+
+  w.close(); r.close();
+  await sleep(150);
+  pgs.stop();
+
   // ── an unset DATABASE_URL is a startup error, not a silent no-op ─────────
   // Requirement 1 is "messages are stored in a database". A server that boots
   // with nowhere to store them and drops every one is the precise failure the
