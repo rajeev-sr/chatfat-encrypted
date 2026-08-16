@@ -188,7 +188,11 @@
     ws.onopen = function () {
       state.attempt = 0;
       setPhase('joining');
-      publishKey();
+      // publishKey() happens on 'welcome', not here: the server refuses any
+      // frame but join/pong from a socket that has not named itself yet
+      // (dispatch in src/transport/websocket.js), so sending it before join
+      // completes would just get FORBIDDEN'd — this used to be exactly that
+      // bug, silently, for the whisper key.
       // Identity came from the cookie at the upgrade; join carries nothing.
       if (state.auth) send('join', {});
       else send('join', { username: state.wantName });
@@ -421,6 +425,18 @@
     shackle.setAttribute('d', 'M7 11V7a5 5 0 0 1 10 0v4');
     svg.appendChild(body); svg.appendChild(shackle);
     return svg;
+  }
+
+  function warnIcon() {
+    var warn = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    warn.setAttribute('class', 'svg'); warn.setAttribute('width', '14'); warn.setAttribute('height', '14');
+    warn.setAttribute('viewBox', '0 0 24 24');
+    var tri = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    tri.setAttribute('d', 'M12 4l9 16H3z');
+    var bang = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    bang.setAttribute('d', 'M12 10v4M12 17h.01');
+    warn.appendChild(tri); warn.appendChild(bang);
+    return warn;
   }
 
   function peopleLabel(n) { return n === 0 ? 'empty' : n + ' ' + (n === 1 ? 'person' : 'people'); }
@@ -929,7 +945,7 @@
   // on every repaint. Re-deriving it here would compare the message against
   // state.last — which, for the newest message, is the message itself — and a
   // reaction, an edit or a decryption would silently strip its own header.
-  function buildMessage(data, plain, isGrouped) {
+  function buildMessage(data, plain, isGrouped, sigFailed) {
     var row = document.createElement('div');
     row.className = 'cf-msg';
     row.style.setProperty('--uc', data.colour);
@@ -987,9 +1003,32 @@
       stack.appendChild(quoteBlock(data.replyTo, parentText ? parentText.slice(0, 140) : ''));
     }
 
-    // The three encrypted states, plus the integrity failure, plus plain text.
+    // The three encrypted states, plus the two integrity failures (in-transit
+    // vs at-rest), plus plain text.
     var body;
-    if (data.unsent) {
+    if (data.tampered) {
+      // Requirement 4: the SERVER detected this on read — the stored row no
+      // longer matches its own authentication tag, which means it was altered
+      // directly in the database, not in transit. Different wording from the
+      // E2E case below on purpose: this is not "your key is wrong", it is
+      // "something is wrong with the row itself".
+      body = document.createElement('div');
+      body.className = 'cf-fail';
+      body.appendChild(warnIcon());
+      body.appendChild(document.createTextNode(
+        'This message failed its integrity check in storage — it appears to have been altered directly in the database.'));
+    } else if (sigFailed) {
+      // Requirement 6, the client-independent half: THIS BROWSER re-verified
+      // the sender's signature itself, against the sender's own published
+      // public key — not taking the server's word for it — and it did not
+      // check out. Unlike `tampered` above (a stored row, caught on read),
+      // this can also catch a LIVE broadcast altered in transit, which is a
+      // gap the server's own send-time verification cannot close for itself.
+      body = document.createElement('div');
+      body.className = 'cf-fail';
+      body.appendChild(warnIcon());
+      body.appendChild(document.createTextNode('This message failed its integrity check — it was altered in transit.'));
+    } else if (data.unsent) {
       body = document.createElement('div');
       body.className = 'cf-text';
       body.textContent = 'This message was unsent.';
@@ -1007,15 +1046,7 @@
     } else if (data.enc && plain === false) {
       body = document.createElement('div');
       body.className = 'cf-fail';
-      var warn = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-      warn.setAttribute('class', 'svg'); warn.setAttribute('width', '14'); warn.setAttribute('height', '14');
-      warn.setAttribute('viewBox', '0 0 24 24');
-      var tri = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      tri.setAttribute('d', 'M12 4l9 16H3z');
-      var bang = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-      bang.setAttribute('d', 'M12 10v4M12 17h.01');
-      warn.appendChild(tri); warn.appendChild(bang);
-      body.appendChild(warn);
+      body.appendChild(warnIcon());
       body.appendChild(document.createTextNode('This message failed its integrity check — it was altered in transit.'));
     } else {
       body = document.createElement('div');
@@ -1048,7 +1079,7 @@
   function renderMessage(data, plain, atTop) {
     var existing = state.msgs.get(data.id);
     if (existing && existing.node.parentNode) {
-      var replacement = buildMessage(data, existing.plain, existing.grouped);
+      var replacement = buildMessage(data, existing.plain, existing.grouped, existing.sigFailed);
       existing.node.parentNode.replaceChild(replacement, existing.node);
       existing.data = data;
       existing.node = replacement;
@@ -1059,28 +1090,30 @@
     // asked for it. It also must not advance state.last, which tracks the
     // NEWEST message for grouping the next live one.
     if (atTop) {
-      var oldNode = buildMessage(data, plain, false);
-      state.msgs.set(data.id, { data: data, node: oldNode, plain: plain, grouped: false });
+      var oldNode = buildMessage(data, plain, false, false);
+      state.msgs.set(data.id, { data: data, node: oldNode, plain: plain, grouped: false, sigFailed: false });
       var anchor = document.getElementById('cf-histtop');
       el.log.insertBefore(oldNode, anchor ? anchor.nextSibling : el.log.firstChild);
+      verifySigInto(data.id);
       return oldNode;
     }
 
     maybeDay(data.ts);
     var isGrouped = grouped(data);
-    var node = buildMessage(data, plain, isGrouped);
-    state.msgs.set(data.id, { data: data, node: node, plain: plain, grouped: isGrouped });
+    var node = buildMessage(data, plain, isGrouped, false);
+    state.msgs.set(data.id, { data: data, node: node, plain: plain, grouped: isGrouped, sigFailed: false });
     var mine = state.me && data.fromId === state.me.id;
     place(node, { counts: !mine });
     state.last = data;
     notifyIfMentioned(data, plain);
+    verifySigInto(data.id);
     return node;
   }
 
   function repaint(id) {
     var entry = state.msgs.get(id);
     if (!entry) return;
-    var node = buildMessage(entry.data, entry.plain, entry.grouped);
+    var node = buildMessage(entry.data, entry.plain, entry.grouped, entry.sigFailed);
     if (entry.node.parentNode) entry.node.parentNode.replaceChild(node, entry.node);
     entry.node = node;
   }
@@ -1335,16 +1368,37 @@
 
   /* ══ sending ════════════════════════════════════════════════════════════ */
 
+  // Guarantees FIFO delivery for signed frames. Signing is async (WebCrypto),
+  // so two sends fired close together — fast typing plus Enter, or a
+  // double-submit — could otherwise have their signatures resolve, and
+  // therefore reach the server, in a different order than they were composed
+  // in: a message reordering itself relative to its own sender's other
+  // messages. Chaining forces each signature to be computed strictly after
+  // the previous send's, so the synchronous send() right after it always
+  // fires in call order too.
+  var signChain = Promise.resolve();
+  function signInOrder(fields) {
+    var result = signChain.then(function () { return C.signMessage(fields); });
+    signChain = result.catch(function () {}); // one failure must not wedge every send after it
+    return result;
+  }
+
   async function sendChat(text, options) {
     options = options || {};
     if (text.length > state.config.maxText) return toast('That message is too long.', true, 'TOO_LONG');
+    // Requirement 5: no signing key, no send — the server enforces this too,
+    // but failing here gives a message that actually explains why, instead of
+    // a generic error frame.
+    if (!C.available) return toast('This browser has no WebCrypto, so messages cannot be signed. Nothing was sent.', true);
 
     var locked = state.room && roomIsLocked(state.room);
-    var payload = { text: text, action: !!options.action };
-    if (options.ttl) payload.ttl = options.ttl;
 
     if (!locked) {
-      var frame = { text: text, action: !!options.action };
+      // Requirement 6: signed over exactly {room, from, text, enc:null} —
+      // identically to what src/transport/handlers.js reconstructs and
+      // verifies server-side before this is accepted.
+      var signed = await signInOrder({ room: state.room, from: state.me.name, text: text, enc: null });
+      var frame = { text: text, action: !!options.action, sig: signed.sig };
       if (state.replyTo) frame.replyTo = state.replyTo.id;
       if (options.ttl) frame.ttl = options.ttl;
       send('chat', frame);
@@ -1373,7 +1427,11 @@
       if (parent && parent.plain) inner.replyText = String(parent.plain.text).slice(0, 140);
     }
     var envelope = await C.encryptRoom(entry, state.room, inner);
-    var out = { enc: envelope };
+    // Signed over {room, from, text:'', enc}: the server never sees this
+    // message's real text, only the envelope, so that is what gets signed —
+    // same shape the server reconstructs for a locked-room chat frame.
+    var signedEnc = await signInOrder({ room: state.room, from: state.me.name, text: '', enc: envelope });
+    var out = { enc: envelope, sig: signedEnc.sig };
     if (state.replyTo) out.replyTo = state.replyTo.id;
     if (options.ttl) out.ttl = options.ttl;
     send('chat', out);
@@ -1442,14 +1500,22 @@
     var commit = async function () {
       var next = area.value.trim();
       if (!next) return cancelEdit();
+      if (!C.available) { toast('This browser has no WebCrypto, so the edit cannot be signed. Nothing was sent.', true); return cancelEdit(); }
+      // The signed `from` is the message's ORIGINAL author name (data.from),
+      // not necessarily state.me.name — a /nick between the original send and
+      // this edit must not change what the server checks the signature
+      // against (src/transport/handlers.js verifies against message.from).
       if (state.room && roomIsLocked(state.room)) {
         var key = currentKey(state.room);
         if (!key) return toast('Unlock this room first.', true);
         var mine = state.msgs.get(data.id);
         var inner = { text: next, mentions: (mine && mine.plain && mine.plain.mentions) || [], action: !!(mine && mine.plain && mine.plain.action) };
-        send('edit', { id: data.id, enc: await C.encryptRoom(key, state.room, inner) });
+        var envelope = await C.encryptRoom(key, state.room, inner);
+        var signed = await signInOrder({ room: state.room, from: data.from, text: '', enc: envelope });
+        send('edit', { id: data.id, enc: envelope, sig: signed.sig });
       } else {
-        send('edit', { id: data.id, text: next });
+        var signedPlain = await signInOrder({ room: state.room, from: data.from, text: next, enc: null });
+        send('edit', { id: data.id, text: next, sig: signedPlain.sig });
       }
       cancelEdit();
     };
@@ -1777,13 +1843,52 @@
     state.polls.forEach(function (entry) { upsertPoll(entry.data); });
   }
 
-  function publishKey() {
-    if (!C.available) return;
-    if (state.myKeyPair) { send('key:publish', { pub: state.myKeyPair.pubB64 }); return; }
-    C.newKeyPair().then(function (pair) {
-      state.myKeyPair = pair;
-      send('key:publish', { pub: pair.pubB64 });
-    }).catch(function () {});
+  // Requirement 6, verified independently by THIS browser — see the comment
+  // on the sigFailed branch in buildMessage. `data.text`/`data.enc` here are
+  // exactly what the server sent and exactly what it verified against — for a
+  // locked room that's the ciphertext envelope (text is always '' from the
+  // server), not the decrypted plaintext, matching what was actually signed.
+  async function verifySigInto(id) {
+    var entry = state.msgs.get(id);
+    if (!entry || !entry.data.sig || !entry.data.sigPub || entry.data.dm) return;
+    if (entry.data.tampered) return; // the server already told us — do not re-flag with different wording
+    var ok = await C.verifySignature(entry.data.sigPub, entry.data.sig, {
+      room: state.room, from: entry.data.from, text: entry.data.text, enc: entry.data.enc || null,
+    });
+    if (ok) return; // already renders as sigFailed:false by default — nothing to repaint
+    entry.sigFailed = true;
+    repaint(id);
+  }
+
+  // Resolves once both this browser's whisper (ECDH) and signing (ECDSA)
+  // keypairs exist — generating or loading from IndexedDB at most once per
+  // page, however many times this is called. Cached, not re-run per call.
+  var keysPromise = null;
+  function ensureKeys() {
+    if (keysPromise) return keysPromise;
+    keysPromise = (async function () {
+      if (!C.available) return null;
+      if (!state.myKeyPair) {
+        try { state.myKeyPair = await C.newKeyPair(); } catch (e) {}
+      }
+      try { return await C.signingKeyPair(); } catch (e) { return null; }
+    })();
+    return keysPromise;
+  }
+
+  // Publishes both public keys to THIS connection. Unlike ensureKeys() above,
+  // this is NOT cached — it must run again on every reconnect, because the
+  // server's session (and therefore session.sigPub — see src/transport/
+  // handlers.js) is brand new each time, even though the keys themselves are
+  // the same ones reused from IndexedDB.
+  function publishKeys() {
+    return ensureKeys().then(function (sig) {
+      state.sigPub = sig ? sig.pubB64 : null;
+      var payload = {};
+      if (state.myKeyPair) payload.pub = state.myKeyPair.pubB64;
+      if (sig) payload.sigPub = sig.pubB64;
+      if (payload.pub || payload.sigPub) send('key:publish', payload);
+    });
   }
 
   function encryptionBanner() {
@@ -1818,6 +1923,11 @@
         ls(LS.name, state.me.name);
         el.lobbyMe.textContent = state.me.name;
         paintMe();
+        // Awaited, and BEFORE flushQueue(): the server refuses any chat/edit
+        // frame from a session with no signing key published yet (requirement
+        // 5), so the publish has to actually reach the server — not just be
+        // requested — before any queued message is released to it.
+        await publishKeys();
         flushQueue();
         // Walk straight back into the room we were in before the line dropped.
         if (state.wantRoom) { send('room:join', { room: state.wantRoom }); setPhase('joining'); }
@@ -2023,8 +2133,13 @@
         target.data.mentions = d.mentions || [];
         target.data.editedAt = d.editedAt;
         target.data.enc = d.enc || null;
+        target.data.sig = d.sig || null;
+        target.data.sigPub = d.sigPub || null;
+        target.data.tampered = false; // fresh content from a live edit, not a DB read
+        target.sigFailed = false; // re-checked below against the NEW content, not carried over from the old
         if (d.enc) { target.plain = undefined; repaint(d.id); decryptInto(d.id); }
         else repaint(d.id);
+        verifySigInto(d.id);
         return;
       }
 

@@ -18,6 +18,7 @@ const polls = require('../messages/polls');
 const { repository, detach } = require('../messages/repository');
 const auth = require('../auth');
 const envelope = require('../crypto/envelope');
+const signature = require('../crypto/signature');
 const {
   cleanText,
   cleanName,
@@ -29,6 +30,11 @@ const {
 
 const OPEN = 1;
 const alive = (session) => session.ws.readyState === OPEN;
+
+// An ECDSA P-256 signature (raw r||s, see src/crypto/signature.js) is 64
+// bytes — 88 base64 characters with padding. 150 leaves headroom without
+// accepting something absurd.
+const isValidSig = (s) => envelope.isB64(s) && s.length <= 150;
 
 function claimName(session, name) {
   const key = name.toLowerCase();
@@ -278,6 +284,21 @@ async function onChat(session, d) {
     }
   }
 
+  // Requirements 5 + 6: every sender signs, and the signature is verified
+  // before the message goes anywhere — not decoration after the fact. The
+  // signed payload is exactly {room, from, text, enc} as just computed above,
+  // built identically on both sides — see src/crypto/signature.js.
+  if (!session.sigPub) {
+    return fail(session.ws, 'SIGNATURE_REQUIRED', 'No signing key on file yet for this connection — try again in a moment.');
+  }
+  const sig = d && d.sig;
+  if (!isValidSig(sig)) {
+    return fail(session.ws, 'SIGNATURE_REQUIRED', 'This message is missing a valid signature.');
+  }
+  if (!signature.verify(session.sigPub, sig, { room: room.id, from: session.name, text, enc })) {
+    return fail(session.ws, 'FORBIDDEN', 'Signature does not verify.');
+  }
+
   const message = {
     kind: 'chat',
     id: newId('m'),
@@ -296,6 +317,8 @@ async function onChat(session, d) {
     editedAt: null,
     unsent: false,
     enc,
+    sig,
+    sigPub: session.sigPub,
   };
 
   const ttl = Number(d && d.ttl);
@@ -452,21 +475,46 @@ function onEdit(session, d) {
       : fail(session.ws, 'FORBIDDEN', 'This room is not encrypted.');
   }
 
+  let newText;
+  let newEnc;
+  let newMentions;
   if (hasEnc) {
     const bad = envelope.validateRoomEnvelope(d.enc);
     if (bad) return fail(session.ws, bad.code, bad.message);
-    message.enc = envelope.sanitiseRoomEnvelope(d.enc);
-    message.text = '';
-    message.mentions = [];
+    newEnc = envelope.sanitiseRoomEnvelope(d.enc);
+    newText = '';
+    newMentions = [];
   } else {
-    const text = cleanText(d.text);
-    if (!text) return;
-    if (text.length > config.MAX_TEXT) {
+    newText = cleanText(d.text);
+    if (!newText) return;
+    if (newText.length > config.MAX_TEXT) {
       return fail(session.ws, 'TOO_LONG', `Messages are ${config.MAX_TEXT} characters or fewer.`);
     }
-    message.text = text;
-    message.mentions = resolveMentions(text, room.id, session.id);
+    newEnc = null;
+    newMentions = resolveMentions(newText, room.id, session.id);
   }
+
+  // Requirements 5 + 6, same gate as onChat: the edit is re-signed over its
+  // NEW content and re-verified before it is applied. The signed `from` is
+  // the message's original author name, not necessarily session.name — a
+  // rename between the original send and this edit must not change what the
+  // edit's signature is checked against.
+  if (!session.sigPub) {
+    return fail(session.ws, 'SIGNATURE_REQUIRED', 'No signing key on file yet for this connection — try again in a moment.');
+  }
+  const sig = d && d.sig;
+  if (!isValidSig(sig)) {
+    return fail(session.ws, 'SIGNATURE_REQUIRED', 'This edit is missing a valid signature.');
+  }
+  if (!signature.verify(session.sigPub, sig, { room: room.id, from: message.from, text: newText, enc: newEnc })) {
+    return fail(session.ws, 'FORBIDDEN', 'Signature does not verify.');
+  }
+
+  message.text = newText;
+  message.enc = newEnc;
+  message.mentions = newMentions;
+  message.sig = sig;
+  message.sigPub = session.sigPub;
   message.editedAt = Date.now();
 
   broadcast(room.id, 'edited', {
@@ -475,6 +523,8 @@ function onEdit(session, d) {
     editedAt: message.editedAt,
     mentions: message.mentions,
     enc: message.enc,
+    sig: message.sig,
+    sigPub: message.sigPub,
   });
   detach(
     repository.update(message.id, {
@@ -482,6 +532,8 @@ function onEdit(session, d) {
       editedAt: message.editedAt,
       mentions: message.mentions,
       enc: message.enc,
+      sig: message.sig,
+      sigPub: message.sigPub,
     }),
     'an edit',
   );
@@ -587,10 +639,21 @@ function onPong(session, d) {
   send(session.ws, 'rtt', { rtt: session.rtt });
 }
 
+// Publishes one or both of a session's public keys: `pub` (ECDH, for sealed
+// whispers) and `sigPub` (ECDSA, for signing chat/edits — requirement 5).
+// Either may arrive alone or together; the client currently always sends
+// both at once, generated together on connect.
 function onKeyPublish(session, d) {
   const pub = d && d.pub;
-  if (!envelope.isB64(pub) || pub.length > 400) return fail(session.ws, 'FORBIDDEN', 'Malformed public key.');
-  session.pub = pub;
+  const sigPub = d && d.sigPub;
+  if (pub !== undefined && (!envelope.isB64(pub) || pub.length > 400)) {
+    return fail(session.ws, 'FORBIDDEN', 'Malformed public key.');
+  }
+  if (sigPub !== undefined && (!envelope.isB64(sigPub) || sigPub.length > 400)) {
+    return fail(session.ws, 'FORBIDDEN', 'Malformed signing key.');
+  }
+  if (pub !== undefined) session.pub = pub;
+  if (sigPub !== undefined) session.sigPub = sigPub;
   if (session.room) {
     rooms.pushKeys(session.room);
     rooms.pushRoster(session.room);

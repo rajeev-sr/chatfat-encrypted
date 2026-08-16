@@ -38,6 +38,51 @@ const DATABASE_URL_SET = RAW_DATABASE_URL !== '';
 const PERSISTENCE_ENABLED = !!DATABASE_URL;
 const USE_POSTGRES = PERSISTENCE_ENABLED && DATABASE_URL !== 'memory';
 
+// At-rest encryption keys — versioned so a rotated MASTER_KEY does not strand
+// history sealed under the old one. `MASTER_KEYS=v1:<b64>,v2:<b64>` wins when
+// set; a bare `MASTER_KEY` is shorthand for a single key at version 1. The
+// CURRENT version (the highest number present) is what new writes encrypt
+// under; every version present can still decrypt what it sealed.
+//
+// Validity (32 decoded bytes, for AES-256) is checked here so a malformed key
+// is a parse error rather than a mysterious decrypt failure at message time.
+// Presence is enforced by app.js at boot, not here — config.js only parses,
+// it does not decide whether persistence requires a key.
+function parseMasterKeys() {
+  const map = new Map();
+  const add = (version, b64) => {
+    if (!Number.isInteger(version) || version < 1) {
+      throw new Error(`MASTER_KEYS: "${version}" is not a valid key version — use v1, v2, …`);
+    }
+    let buf;
+    try {
+      buf = Buffer.from(b64, 'base64');
+    } catch {
+      buf = Buffer.alloc(0);
+    }
+    if (buf.length !== 32) {
+      throw new Error(`MASTER_KEYS: key version ${version} decodes to ${buf.length} bytes, not the 32 AES-256 needs`);
+    }
+    map.set(version, buf);
+  };
+
+  const multi = str('MASTER_KEYS', '');
+  if (multi) {
+    for (const part of multi.split(',').map((s) => s.trim()).filter(Boolean)) {
+      const at = part.indexOf(':');
+      if (at < 1) throw new Error(`MASTER_KEYS: "${part}" is not "v<n>:<base64>"`);
+      add(Number(part.slice(1, at).replace(/^v/i, '')), part.slice(at + 1));
+    }
+  } else {
+    const single = str('MASTER_KEY', '');
+    if (single) add(1, single);
+  }
+  return map;
+}
+
+const MASTER_KEYS = parseMasterKeys();
+const MASTER_KEY_VERSION = MASTER_KEYS.size ? Math.max(...MASTER_KEYS.keys()) : 0;
+
 module.exports = {
   // — environment —
   PORT: int('PORT', 3000, 1, 65535),
@@ -68,6 +113,10 @@ module.exports = {
   BETTER_AUTH_SECRET: str('BETTER_AUTH_SECRET', ''),
   BETTER_AUTH_URL: str('BETTER_AUTH_URL', `http://localhost:${int('PORT', 3000, 1, 65535)}`),
   MAX_CIPHERTEXT: int('MAX_CIPHERTEXT', 12288, 1024, 1024 * 1024),
+  // At-rest encryption of stored message text (requirement 3) and its keys
+  // (requirement 4 rides on the same AEAD tag — see src/crypto/atRest.js).
+  MASTER_KEYS,
+  MASTER_KEY_VERSION,
 
   // — derived —
   PERSISTENCE_ENABLED,

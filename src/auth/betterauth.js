@@ -70,6 +70,7 @@ function auth() {
     // machine lab LAN is all of them.
     trustedOrigins: (request) => {
       if (config.ALLOWED_ORIGINS.length) return config.ALLOWED_ORIGINS;
+      if (!request) return [];
       const host = request.headers.get('host');
       if (!host) return [];
       const scheme = String(config.BETTER_AUTH_URL).startsWith('https://') ? 'https' : 'http';

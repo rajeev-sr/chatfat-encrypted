@@ -57,6 +57,15 @@ Two things worth knowing before a demo:
 - **`pg` prints an SSL deprecation warning** for `sslmode=require` on startup. It is
   noise, not a misconfiguration; `verify-full` is what the driver already does.
 
+**A `*.neon.tech` host automatically uses `@neondatabase/serverless` instead of `pg`** —
+`src/db/pool.js` picks the driver by hostname, not by config. This tunnels the real Postgres
+protocol over a WebSocket on port 443 rather than raw TCP on 5432. It matters because 5432 is
+not always reachable: a campus or office network that only allows standard web ports out blocks
+it *silently* — a timeout, not a rejection, and easy to mistake for a Neon or credentials
+problem when it is neither. Test for this specifically with `nc -zv <pooler-host> 5432`; if that
+hangs, it's the network, and the automatic switch to port 443 is what fixes it. `docker-compose.yml`'s
+local Postgres has no such WebSocket proxy and correctly keeps using plain `pg`.
+
 The schema is applied by numbered migrations in `src/db/migrations/`, tracked in a
 `schema_version` table, each inside a transaction and behind an advisory lock so two
 servers booting at once cannot both apply the same one. Editing a migration that has
@@ -131,6 +140,65 @@ the old one can still read older ones — rotation does not re-encrypt history.
 
 ---
 
+## At-rest encryption
+
+Every stored message's `text` is encrypted with AES-256-GCM under a server-held
+`MASTER_KEY` before it reaches the database — regardless of whether the room is locked.
+This is a **different** guarantee from an encrypted room above, not a replacement for it:
+
+| | Locked room (opt-in, per room) | At-rest encryption (always, every room) |
+| --- | --- | --- |
+| Key held by | Room members, derived from a passphrase | The server, via `MASTER_KEY` |
+| Server can read it | No | Yes — that's the difference |
+| Protects against | The operator, the network, a DB dump | A DB dump, a stolen backup, raw SQL access |
+
+Losing `MASTER_KEY` makes all stored history unreadable — intended, not a bug. Back it up
+somewhere that is not this repo. `MASTER_KEYS=v1:<old>,v2:<new>` lets you rotate without
+stranding what the old key sealed.
+
+**Tamper detection falls out of the same mechanism.** GCM's authentication tag is bound to
+the message's own id, so a row altered directly in the database — a bit flipped, or one
+row's ciphertext pasted into another's columns — fails to decrypt instead of decrypting to
+garbage or to someone else's message. This is checked on every read (room join, scrollback),
+not on a schedule: the server logs it, and the message renders with a visible integrity
+warning instead of its (missing) content. Demonstrate it yourself:
+
+```bash
+ALLOW_TAMPER=1 node tools/tamper.js --room lab-room
+```
+
+then rejoin that room (or page back to it) in a running server.
+
+---
+
+## Message signing
+
+Every sender has an ECDSA P-256 signing keypair, generated in the browser and kept in
+IndexedDB — one per browser, reused across reconnects, never sent anywhere. Every `chat`
+and `edit` is signed over `{room, sender, content}` before it leaves the browser, and
+**verified twice**:
+
+- **Server-side, before acceptance.** `onChat`/`onEdit` (`src/transport/handlers.js`) verify
+  against the signing key that connection published; an unsigned, malformed, or wrongly-signed
+  frame is refused outright — `SIGNATURE_REQUIRED` or `FORBIDDEN` — and never reaches the room
+  or the database.
+- **Client-side, independently, by every reader.** Each browser re-verifies a message's
+  signature against the sender's own public key, itself — not taking the server's word for it.
+  This is what catches a *live* broadcast altered in transit, a gap the server's own send-time
+  check cannot close for its own traffic.
+
+The signature travels with the stored row and is **re-verified on every future read** —
+history replay, scrollback — independently of the at-rest cipher above. A row altered directly
+in the database has to defeat both checks, not one, to pass as legitimate; either one failing
+flags the message the same way tampered at-rest content does.
+
+**Scope, stated plainly:** one signing keypair per *browser*, not per account. Two people
+signed in as different names in the same browser profile would sign with the same key — real
+identity binding would need the key pinned server-side against an account, which this does not
+do.
+
+---
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -147,6 +215,9 @@ the old one can still read older ones — rotation does not re-encrypt history.
 | `AUTH_MAX_ATTEMPTS` | `10` | Failed sign-ins per minute per IP before HTTP 429 |
 | `ENCRYPTION_ENABLED` | `1` | Set to `0` to forbid locking rooms on this server |
 | `MAX_CIPHERTEXT` | `12288` | Byte cap on one ciphertext envelope |
+| `MASTER_KEY` | *(unset ⇒ refuses to start once persistence is on)* | 32 random bytes, base64. Encrypts every stored message's `text` at rest (AES-256-GCM) — separate from, and in addition to, a locked room's client-side key. See "At-rest encryption" below |
+| `MASTER_KEYS` | *(empty)* | `v1:<b64>,v2:<b64>` — a versioned list for key rotation. Overrides `MASTER_KEY` when set; the highest version is what new writes use, every version present can still read what it sealed |
+| `ALLOW_TAMPER` | `0` | Lets `tools/tamper.js` corrupt a stored row on purpose, to demonstrate detection. Never set this on a deployed server |
 | `ChatFat_ENV_FILE` | *(unset)* | Set to `off` to skip reading `.env` entirely. The test suites set this |
 
 A `.env` in the repo root is read at startup. **The real environment always wins.**
@@ -183,6 +254,8 @@ src/
     handlers.js            one function per client frame type
   crypto/
     envelope.js            ciphertext envelope validation and size accounting
+    atRest.js              server-keyed AES-256-GCM for stored text — the at-rest layer
+    signature.js           ECDSA verification — canonical payload + verify(), never signs
 public/
   index.html               join screen + lobby + chat shell (three screens, one document)
   style.css                design tokens, layout, components, light/dark
@@ -194,8 +267,12 @@ test/
   auth.js                  registration through impersonation
   persistence.js           storage + replay
   crypto.js                encrypted rooms and sealed whispers
+  atrest.js                at-rest encryption + tamper detection, against MemoryRepo directly
+  signing.js               signing keypairs + verification — happy path and every refusal
 tools/
   loadtest.js              broadcast fan-out latency as room size grows
+  tamper.js                corrupts one stored row on purpose, to demonstrate detection
+  keygen.js                prints a random MASTER_KEY
 docs/
   ROADMAP.md               the twelve-phase Lab 4 plan + compliance matrix
   progress.md              per-phase status; the tracker that says how far
@@ -217,10 +294,24 @@ npm test                   # protocol   — no database
 npm run test:auth          # accounts
 npm run test:persistence   # storage + replay
 npm run test:crypto        # encrypted rooms + sealed whispers
+npm run test:atrest        # at-rest encryption + tamper detection
+npm run test:signing       # signing keypairs + verification
+npm run test:pg            # durability, keyset pagination, at-rest + tamper — real Postgres
 npm run test:all
 ```
 
-Every suite spawns a real server and drives it with real WebSocket clients. There is no
+`test:pg` needs `TEST_DATABASE_URL` pointed at a real Postgres — it is skipped, loudly,
+without it:
+
+```bash
+TEST_DATABASE_URL=postgresql://… npm run test:pg
+```
+
+Every suite spawns a real server and drives it with real WebSocket clients — except
+`test:atrest`, which reaches into the repository module directly, because what's actually
+sitting in a stored row versus what the wire protocol hands back is exactly the thing a
+WebSocket client can never observe from outside; that opacity is the point of requirement 3.
+`test:pg` proves the same thing again against a real database, over raw SQL. There is no
 mocked clock anywhere: the heartbeat reaper and the burn fuse are real timers and the
 suites wait them out. Each gets `ChatFat_ENV_FILE=off` and an isolated `DATA_DIR`, so a
 developer's `.env` cannot reach a suite and fail it for the wrong reason.
@@ -288,3 +379,12 @@ host, and make sure `Upgrade` and `Connection` are forwarded. Under TLS the clie
   database, but a recipient who screenshots still keeps it.
 - **Encryption protects content, not metadata.** See the table above — and the product says
   this in the key modal and the room banner, not only here.
+- **At-rest encryption trusts the running server.** `MASTER_KEY` protects a database dump or a
+  stolen backup, not a compromised or malicious server process — that guarantee is what a
+  locked room's client-side key is for, and it's a different one.
+- **Tamper detection is reactive, not continuous.** A corrupted row is caught the next time it
+  is actually read — room join, scrollback — not on a schedule. Nothing notices tampering in a
+  row nobody happens to load.
+- **A signing keypair is per browser, not per account.** Two names signed in from the same
+  browser profile share one key. Real per-identity binding would need the key pinned
+  server-side against an account.

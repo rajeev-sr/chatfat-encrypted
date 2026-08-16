@@ -20,9 +20,11 @@ services:
       HOST: 0.0.0.0
       DATABASE_URL: postgresql://chatfat:chatfat@db:5432/chatfat
       HISTORY_REPLAY: 50
-      # Dev-only key. Production takes MASTER_KEY from the host environment,
-      # never from a compose file and never baked into the image.
-      MASTER_KEY: ${MASTER_KEY:-ZGV2LW9ubHktbm90LWEtcmVhbC1rZXktcmVwbGFjZS0h}
+      # Dev-only key — 32 random bytes, base64, genuinely decodes to 32 bytes
+      # (config.js now enforces that at boot). Production takes MASTER_KEY
+      # from the host environment, never from a compose file and never baked
+      # into the image.
+      MASTER_KEY: ${MASTER_KEY:-eBALdyiGzcxV+O1B6KmjDxdaqqahZ8vH+dowLPxmG6U=}
       BETTER_AUTH_URL: http://localhost:3000
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-dev-only-secret-replace-me}
     volumes:

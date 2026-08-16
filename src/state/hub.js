@@ -43,6 +43,7 @@ function createSession(ws, ip) {
     bucket: { tokens: config.BUCKET_SIZE, lastRefill: now },
     ip: ip || 'unknown',
     pub: null, // base64 SPKI of this session's ECDH key, for sealed whispers
+    sigPub: null, // base64 SPKI of this session's ECDSA signing key (requirement 5)
   };
   hub.clients.set(session.id, session);
   return session;

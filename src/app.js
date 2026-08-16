@@ -66,8 +66,48 @@ function requireStorageDecision() {
   process.exit(1);
 }
 
+// Requirement 3 is "messages are not stored as plaintext". Persistence with
+// no key configured would be the exact same silent-failure shape as an unset
+// DATABASE_URL used to be: a server that looks like it satisfies the
+// requirement while writing plaintext the whole time. So this fails the boot
+// the same way requireStorageDecision does, not a warning that scrolls past.
+function requireMasterKey() {
+  if (!config.PERSISTENCE_ENABLED) return; // nothing will be written, nothing to key
+  if (config.MASTER_KEYS.size) return;
+  log.error('DATABASE_URL is set, but no MASTER_KEY is configured — messages would be stored as plaintext.');
+  log.error('');
+  log.error('  Generate one:  node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'base64\'))"');
+  log.error('  Then set:      MASTER_KEY=<that value>');
+  log.error('');
+  log.error('See .env.example. Refusing to start rather than write unencrypted history.');
+  process.exit(1);
+}
+
+// err.message alone is often unhelpful or even absent: node:net and pg throw
+// an AggregateError when every resolved address (IPv4 and IPv6 both) fails,
+// and its own .message is blank — the reason is in .errors[]. The Neon
+// WebSocket driver can reject with something that isn't a plain Error at all
+// (a raw ws error/close event), whose .message is an object, not a string —
+// string-concatenating that prints the useless "[object Object]" rather than
+// throwing, which is exactly the kind of silent dead end this function
+// exists to avoid. util.inspect on the whole thing is the fallback of last
+// resort: whatever shape the error has, SOMETHING legible comes out.
+function describeError(err) {
+  if (!err) return 'unknown error';
+  const bits = [];
+  if (typeof err.message === 'string' && err.message) bits.push(err.message);
+  else if (typeof err.name === 'string' && err.name) bits.push(err.name);
+  if (err.code) bits.push(`code=${err.code}`);
+  if (Array.isArray(err.errors) && err.errors.length) {
+    bits.push('— ' + err.errors.map((e) => `${(e && e.code) || ''} ${(e && e.message) || e}`.trim()).join('; '));
+  }
+  if (!bits.length) bits.push(require('node:util').inspect(err, { depth: 4, breakLength: 200 }));
+  return bits.join(' ');
+}
+
 async function start() {
   requireStorageDecision();
+  requireMasterKey();
 
   if (config.PERSISTENCE_ENABLED) {
     // All-or-nothing. A configured database that cannot be reached must never
@@ -76,7 +116,7 @@ async function start() {
       if (config.USE_POSTGRES) await pool.migrate();
       await repository.init();
     } catch (err) {
-      log.error('DATABASE_URL is set but the store could not be prepared:', err.message);
+      log.error('DATABASE_URL is set but the store could not be prepared:', describeError(err));
       log.error('Refusing to start unauthenticated. Fix the database or unset DATABASE_URL.');
       process.exit(1);
     }

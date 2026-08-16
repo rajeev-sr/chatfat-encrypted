@@ -27,7 +27,12 @@ async function main() {
   eq(hello.d.encryption, true, 'hello says encryption is available');
   ok(typeof hello.d.serverTime === 'number', 'hello carries the server clock');
 
-  a.send('chat', { text: 'too early' });
+  // Raw, not a.send(): a.send('chat', ...) now waits for this client's own
+  // signing key to be published, which never happens for a session that
+  // never joins — this line is deliberately testing what the SERVER does
+  // with a premature frame, the same reason the two lines below it bypass
+  // the wrapper too.
+  a.ws.send(JSON.stringify({ v: 2, t: 'chat', d: { text: 'too early' } }));
   const early = await a.next('error');
   eq(early.d.code, 'FORBIDDEN', 'an unnamed socket cannot chat');
   eq(early.d.message, 'Pick a username first.', 'and is told to pick a name');

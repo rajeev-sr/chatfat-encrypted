@@ -223,6 +223,119 @@
     }
   }
 
+  // ══ Signing — ECDSA P-256, one keypair per browser, persisted ══════════
+  // Requirements 5 + 6: each sender signs every message they send, and it is
+  // verified — server-side before it is even accepted (src/transport/
+  // handlers.js), and again independently by every reader, client-side,
+  // right here. P-256 again, matching the whisper key above, for the same
+  // "universally supported" reasoning.
+  //
+  // The keypair is generated ONCE per browser and kept in IndexedDB — not
+  // localStorage. IndexedDB can hold a CryptoKey object directly via
+  // structured clone, including a NON-EXTRACTABLE one, so the private key
+  // material never exists as bytes any script — this one included — can
+  // read, export, or log. Reusing the same pair across reconnects is what
+  // makes "signing key pair" mean something as an identity claim, rather
+  // than resetting every session the way the whisper ECDH pair does.
+  //
+  // Scope, stated plainly: this is one keypair per BROWSER, not per
+  // username. Two people signed in as different names in the same browser
+  // profile would sign with the same key. That is a real limitation, not an
+  // oversight — scoping identity to an account would need the key pinned
+  // server-side against that account, which is out of scope here.
+
+  var SIG_DB = 'ChatFat-identity';
+  var SIG_STORE = 'keys';
+  var SIG_KEY_NAME = 'signing-keypair';
+
+  function openSigDb() {
+    return new Promise(function (resolve, reject) {
+      if (!window.indexedDB) return reject(new Error('no indexedDB'));
+      var req = indexedDB.open(SIG_DB, 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore(SIG_STORE); };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  function idbGet(db, key) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(SIG_STORE, 'readonly');
+      var req = tx.objectStore(SIG_STORE).get(key);
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  function idbPut(db, key, value) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(SIG_STORE, 'readwrite');
+      tx.objectStore(SIG_STORE).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = function () { reject(tx.error); };
+    });
+  }
+
+  // Resolves to { priv: CryptoKey (non-extractable), pub: CryptoKey, pubB64 }.
+  // Cached after the first call in this page — every caller in this tab gets
+  // the identical pair, generated or loaded at most once.
+  var sigPairPromise = null;
+  function signingKeyPair() {
+    if (sigPairPromise) return sigPairPromise;
+    sigPairPromise = (async function () {
+      var db = null;
+      try { db = await openSigDb(); } catch (e) { /* private browsing, or unsupported — fall through */ }
+
+      if (db) {
+        try {
+          var stored = await idbGet(db, SIG_KEY_NAME);
+          if (stored && stored.priv && stored.pub) {
+            var existing = await subtle.exportKey('spki', stored.pub);
+            return { priv: stored.priv, pub: stored.pub, pubB64: b64(existing) };
+          }
+        } catch (e) { /* corrupt or unreadable — generate a fresh pair below */ }
+      }
+
+      var pair = await subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify']);
+      var exported = await subtle.exportKey('spki', pair.publicKey);
+      var pubB64 = b64(exported);
+
+      if (db) {
+        try { await idbPut(db, SIG_KEY_NAME, { priv: pair.privateKey, pub: pair.publicKey }); } catch (e) {}
+      }
+      return { priv: pair.privateKey, pub: pair.publicKey, pubB64: pubB64 };
+    })();
+    return sigPairPromise;
+  }
+
+  // The exact same fixed, delimited, manually-ordered string
+  // src/crypto/signature.js's canonicalPayload builds server-side. `id` and
+  // `ts` are deliberately absent — the server assigns those AFTER this frame
+  // is sent, so the sender cannot sign what it does not yet know, the same
+  // constraint aadFor() above already works around with a client nonce. If
+  // one of these two functions changes, so must the other.
+  function canonicalPayload(fields) {
+    var encPart = fields.enc
+      ? [fields.enc.alg, fields.enc.kid, fields.enc.n, fields.enc.iv, fields.enc.ct, fields.enc.aadv].join(':')
+      : '';
+    return enc.encode(fields.room + '|' + fields.from + '|' + (fields.text || '') + '|' + encPart);
+  }
+
+  async function signMessage(fields) {
+    var pair = await signingKeyPair();
+    var sig = await subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, pair.priv, canonicalPayload(fields));
+    return { sig: b64(sig), sigPub: pair.pubB64 };
+  }
+
+  // Never throws: a malformed key or signature is just "does not verify" —
+  // the caller does not need to tell that apart from a genuine forgery.
+  async function verifySignature(sigPubB64, sigB64, fields) {
+    try {
+      var pubKey = await subtle.importKey('spki', unb64(sigPubB64), { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+      return await subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pubKey, unb64(sigB64), canonicalPayload(fields));
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ══ Key store — opt-in, per room, warned about ═════════════════════════
   // Off by default. When the box IS ticked the raw key bytes go to
   // localStorage, and the modal says plainly what that means.
@@ -279,6 +392,9 @@
     newKeyPair: newKeyPair,
     sealWhisper: sealWhisper,
     unsealWhisper: unsealWhisper,
+    signingKeyPair: signingKeyPair,
+    signMessage: signMessage,
+    verifySignature: verifySignature,
     remember: remember,
     recall: recall,
     forget: forget,

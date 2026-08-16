@@ -43,6 +43,21 @@ async function signedIn(port, name, password) {
   return c;
 }
 
+// A one-shot raw query against the real database, bypassing the app entirely
+// — used both to inspect what actually landed in a column (requirement 3) and
+// to corrupt a row on purpose (requirement 4), the same way tools/tamper.js
+// does for a real demo.
+async function pgQuery(sql, params) {
+  const { Client } = require('pg');
+  const c = new Client({ connectionString: URL });
+  await c.connect();
+  try {
+    return await c.query(sql, params);
+  } finally {
+    await c.end().catch(() => {});
+  }
+}
+
 // Poll until `want` rows are visible in the room, or give up. Writes are
 // detached from the request path, so the only honest way to know a message is
 // stored is to look.
@@ -144,6 +159,40 @@ async function main() {
   // Losing the directory while keeping the messages would orphan every row.
   eq(joined.d.room.id, 'durable', 'the room created before the restart still exists');
 
+  // ── requirement 3: not stored as plaintext, against REAL postgres ────────
+  const rawRow = await pgQuery('select text, text_kv from messages where id = $1', [before.id]);
+  const { text: rawText, text_kv: rawKv } = rawRow.rows[0];
+  ok(rawText !== 'written before the restart', 'the text column in Postgres is not the plaintext that was sent');
+  ok(rawKv !== null, 'a MASTER_KEYS version is recorded for the row');
+
+  // ── requirement 4: detects modification, against REAL postgres ───────────
+  // A message of its own for this, deliberately NOT `before` — that one's
+  // content is asserted on again later in this file (the pagination check at
+  // the very end reaches back to "written before the restart"), and corrupting
+  // it here would make THAT assertion fail for a reason having nothing to do
+  // with pagination.
+  b.drain().send('chat', { text: 'this row is about to be corrupted' });
+  const toCorrupt = (await b.next('chat')).d;
+  await sleep(400); // the write is detached from the hot path
+
+  // Corrupt the stored ciphertext directly over SQL — no app code involved —
+  // exactly what tools/tamper.js does for a manual demo.
+  const victimRow = await pgQuery('select text from messages where id = $1', [toCorrupt.id]);
+  const victimText = victimRow.rows[0].text;
+  const corruptedText = victimText.slice(0, -4) + (victimText.slice(-4) === 'AAAA' ? 'BBBB' : 'AAAA');
+  await pgQuery('update messages set text = $1 where id = $2', [corruptedText, toCorrupt.id]);
+
+  // Rejoining forces a fresh repository.recent() read, which is where
+  // detection actually happens — see src/messages/repository.js.
+  b.drain().send('room:leave', {});
+  await b.next('room:left');
+  const rejoined = await b.enter('durable');
+  const flagged = rejoined.d.history.find((m) => m.id === toCorrupt.id);
+  ok(flagged && flagged.tampered, 'rejoining after direct SQL corruption flags the row as tampered');
+  eq(flagged && flagged.text, '', 'and its text is not served as if it were legitimate content');
+  const stillFine = rejoined.d.history.find((m) => m.id === before.id);
+  eq(stillFine && stillFine.text, 'written before the restart', "and the row that wasn't touched is unaffected");
+
   // ── keyset pagination against real SQL ───────────────────────────────────
   // The `(ts, id) < ($2, $3)` row comparison is Postgres-specific and the
   // memory repository proves nothing about it, so it gets its own pass here.
@@ -161,8 +210,11 @@ async function main() {
   // the developer's laptop; against Neon in another region, twelve sequential
   // inserts comfortably outlast half a second, and the suite then "finds" a
   // pagination bug that does not exist.
-  const durable = await waitForRows('durable', TOTAL + 1, 20000);
-  eq(durable, TOTAL + 1, 'every message reached the database before the read');
+  //
+  // +2, not +1: `before` plus the `toCorrupt` message the tamper check above
+  // added to this same room.
+  const durable = await waitForRows('durable', TOTAL + 2, 20000);
+  eq(durable, TOTAL + 2, 'every message reached the database before the read');
 
   b.close();
   await sleep(200);

@@ -10,6 +10,8 @@
 const config = require('../config');
 const log = require('../logger');
 const pool = require('../db/pool');
+const atRest = require('../crypto/atRest');
+const signature = require('../crypto/signature');
 
 // Ordering is (ts, id), never ts alone. Two messages can share a millisecond —
 // a burst of three from the same client routinely does — and a cursor that
@@ -31,18 +33,60 @@ function encColumns(m) {
     : [null, null, null, null, null, null];
 }
 
+// — at-rest text encryption (requirement 3), shared by both durable backends
+//   so MemoryRepo exercises the exact same path PgRepo does. —
+//
+// `text` is the only field this protects: it's the one place user-authored
+// plaintext lands in a column. A locked room's messages already have
+// text === '' — their content lives in enc_ct instead, under a key the
+// server never holds — so there is nothing to encrypt there, and `textKv`
+// stays null. That null is the signal decryptTextField uses to tell "nothing
+// was encrypted here" apart from "encryption of an empty string".
+function encryptTextField(m) {
+  if (!m.text) return { text: m.text || '', textIv: null, textKv: null };
+  const enc = atRest.encryptText(m.text, m.id);
+  return { text: enc.ct, textIv: enc.iv, textKv: enc.kv };
+}
+
+// Returns { text, tampered }. `tampered` is requirement 4: the AEAD tag
+// covers the ciphertext AND the message id (as AAD), so a row altered
+// directly in the database — a bit flipped, or one row's ciphertext pasted
+// into another's columns — fails here instead of decrypting to garbage or to
+// someone else's message. Never throws; see src/crypto/atRest.js.
+function decryptTextField(ct, iv, kv, id) {
+  if (kv === null || kv === undefined) return { text: ct || '', tampered: false };
+  const out = atRest.decryptText(ct, iv, kv, id);
+  if (out.ok) return { text: out.text, tampered: false };
+  log.warn(`at-rest decryption failed for message ${id} — flagging as tampered`);
+  return { text: '', tampered: true };
+}
+
+// — requirement 4, second layer: re-verify the sender's own signature
+//   (requirements 5+6) against the stored content, independent of the at-rest
+//   cipher above. The two checks share no secret, so a row that defeats one
+//   still has to defeat the other to pass as legitimate. Skipped when the
+//   at-rest check already flagged the row — no point verifying a signature
+//   against text that is already known to be '' because decryption failed. —
+function signatureTampered(m, roomId) {
+  if (!m.sig || !m.sigPub) return false; // predates signing, or was never signed — nothing to check
+  const ok = signature.verify(m.sigPub, m.sig, { room: roomId, from: m.from, text: m.text, enc: m.enc });
+  if (!ok) log.warn(`signature verification failed for message ${m.id} — flagging as tampered`);
+  return !ok;
+}
+
 function rowToMessage(row) {
   const enc = row.enc_alg
     ? { alg: row.enc_alg, kid: row.enc_kid, n: row.enc_n, iv: row.enc_iv, ct: row.enc_ct, aadv: row.enc_aadv }
     : null;
-  return {
+  const { text, tampered: decryptTampered } = decryptTextField(row.text, row.text_iv, row.text_kv, row.id);
+  const message = {
     kind: 'chat',
     id: row.id,
     ts: Number(row.ts),
     from: row.from_name,
     fromId: row.from_id,
     colour: row.colour,
-    text: row.text || '',
+    text,
     action: !!row.action,
     replyTo: row.reply_to || null,
     mentions: row.mentions || [],
@@ -51,7 +95,12 @@ function rowToMessage(row) {
     unsent: !!row.unsent,
     ...(row.expires_at ? { expiresAt: Number(row.expires_at) } : {}),
     enc,
+    sig: row.sig || null,
+    sigPub: row.sig_pub || null,
   };
+  const tampered = decryptTampered || signatureTampered(message, row.room_id);
+  if (tampered) message.tampered = true;
+  return message;
 }
 
 // — null: nothing is stored, nothing is replayed —
@@ -78,17 +127,30 @@ class NullRepo {
 class MemoryRepo {
   constructor() {
     this.kind = 'memory';
-    this.rows = new Map(); // messageId -> message copy
+    this.rows = new Map(); // messageId -> { roomId, m: stored copy, text AT REST }
   }
   async init() {}
 
   async save(roomId, m) {
-    this.rows.set(m.id, { roomId, m: JSON.parse(JSON.stringify(m)) });
+    const copy = JSON.parse(JSON.stringify(m));
+    const { text, textIv, textKv } = encryptTextField(copy);
+    copy.text = text;
+    copy.textIv = textIv;
+    copy.textKv = textKv;
+    this.rows.set(m.id, { roomId, m: copy });
   }
 
   async update(id, patch) {
     const hit = this.rows.get(id);
-    if (hit) Object.assign(hit.m, JSON.parse(JSON.stringify(patch)));
+    if (!hit) return;
+    const p = JSON.parse(JSON.stringify(patch));
+    if ('text' in p) {
+      const { text, textIv, textKv } = encryptTextField({ id, text: p.text });
+      p.text = text;
+      p.textIv = textIv;
+      p.textKv = textKv;
+    }
+    Object.assign(hit.m, p);
   }
 
   async remove(id) {
@@ -102,7 +164,7 @@ class MemoryRepo {
       if (rid === roomId && !m.unsent) out.push(m); // unsent rows are excluded from replay
     }
     out.sort(byTsThenId);
-    return out.slice(-limit).map((m) => JSON.parse(JSON.stringify(m)));
+    return out.slice(-limit).map((m) => decorateStored(m, roomId));
   }
 
   // The page strictly older than the cursor. Same ordering rule as recent(),
@@ -116,12 +178,27 @@ class MemoryRepo {
       out.push(m);
     }
     out.sort(byTsThenId);
-    return out.slice(-limit).map((m) => JSON.parse(JSON.stringify(m)));
+    return out.slice(-limit).map((m) => decorateStored(m, roomId));
   }
 
   async close() {
     this.rows.clear();
   }
+}
+
+// Decrypts a stored row FOR A READER, without mutating the stored copy — the
+// ciphertext is what's durable; one read must not decrypt it for good. Also
+// re-verifies the signature (requirement 4's second layer — see
+// signatureTampered above).
+function decorateStored(m, roomId) {
+  const copy = JSON.parse(JSON.stringify(m));
+  const { text, tampered: decryptTampered } = decryptTextField(copy.text, copy.textIv, copy.textKv, copy.id);
+  copy.text = text;
+  delete copy.textIv;
+  delete copy.textKv;
+  const tampered = decryptTampered || signatureTampered(copy, roomId);
+  if (tampered) copy.tampered = true;
+  return copy;
 }
 
 // — postgres —
@@ -133,11 +210,12 @@ class PgRepo {
   async init() {}
 
   async save(roomId, m) {
+    const { text, textIv, textKv } = encryptTextField(m);
     await pool.query(
       `insert into messages
-         (id, room_id, ts, from_name, from_id, colour, text, action, reply_to, mentions,
-          reactions, edited_at, unsent, expires_at, enc_alg, enc_kid, enc_n, enc_iv, enc_ct, enc_aadv)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+         (id, room_id, ts, from_name, from_id, colour, text, text_iv, text_kv, action, reply_to, mentions,
+          reactions, edited_at, unsent, expires_at, enc_alg, enc_kid, enc_n, enc_iv, enc_ct, enc_aadv, sig, sig_pub)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
        on conflict (id) do nothing`,
       [
         m.id,
@@ -146,7 +224,9 @@ class PgRepo {
         m.from,
         m.fromId,
         m.colour,
-        m.text || '',
+        text,
+        textIv,
+        textKv,
         !!m.action,
         m.replyTo ? JSON.stringify(m.replyTo) : null,
         JSON.stringify(m.mentions || []),
@@ -155,6 +235,8 @@ class PgRepo {
         !!m.unsent,
         m.expiresAt ?? null,
         ...encColumns(m),
+        m.sig || null,
+        m.sigPub || null,
       ],
     );
   }
@@ -166,7 +248,12 @@ class PgRepo {
       vals.push(v);
       sets.push(`${col} = $${vals.length}`);
     };
-    if ('text' in patch) put('text', patch.text || '');
+    if ('text' in patch) {
+      const { text, textIv, textKv } = encryptTextField({ id, text: patch.text });
+      put('text', text);
+      put('text_iv', textIv);
+      put('text_kv', textKv);
+    }
     if ('editedAt' in patch) put('edited_at', patch.editedAt);
     if ('mentions' in patch) put('mentions', JSON.stringify(patch.mentions || []));
     if ('reactions' in patch) put('reactions', JSON.stringify(patch.reactions || {}));
@@ -180,6 +267,8 @@ class PgRepo {
       put('enc_ct', e ? e.ct : null);
       put('enc_aadv', e ? e.aadv : null);
     }
+    if ('sig' in patch) put('sig', patch.sig || null);
+    if ('sigPub' in patch) put('sig_pub', patch.sigPub || null);
     if (!sets.length) return;
     vals.push(id);
     await pool.query(`update messages set ${sets.join(', ')} where id = $${vals.length}`, vals);
