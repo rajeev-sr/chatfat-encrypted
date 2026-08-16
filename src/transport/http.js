@@ -3,6 +3,7 @@
 'use strict';
 
 const http = require('node:http');
+const https = require('node:https');
 const fs = require('node:fs');
 const path = require('node:path');
 const config = require('../config');
@@ -116,7 +117,7 @@ function handleBetterAuth(req, res, ip) {
 }
 
 function createServer() {
-  return http.createServer((req, res) => {
+  const handler = (req, res) => {
     const { pathname } = new URL(req.url, 'http://localhost');
     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
 
@@ -126,7 +127,15 @@ function createServer() {
       return json(res, 405, { code: 'BAD_REQUEST', message: 'GET only.' });
     }
     return serveStatic(req, res, pathname);
-  });
+  };
+
+  if (config.TLS_CERT_FILE && config.TLS_KEY_FILE) {
+    const cert = fs.readFileSync(config.TLS_CERT_FILE);
+    const key = fs.readFileSync(config.TLS_KEY_FILE);
+    log.info(`TLS enabled — cert ${config.TLS_CERT_FILE}`);
+    return https.createServer({ cert, key }, handler);
+  }
+  return http.createServer(handler);
 }
 
 module.exports = { createServer, healthz, sweepThrottle, attempts };

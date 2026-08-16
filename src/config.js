@@ -91,6 +91,12 @@ module.exports = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
+  // Both set ⇒ the server terminates TLS itself (node:https instead of
+  // node:http). Meant for a host with no reverse proxy and no real domain —
+  // a self-signed pair still makes the origin "https://", which is what
+  // WebCrypto and Better Auth's Secure cookies actually check for.
+  TLS_CERT_FILE: str('TLS_CERT_FILE', ''),
+  TLS_KEY_FILE: str('TLS_KEY_FILE', ''),
   DATABASE_URL,
   DATABASE_URL_SET,
   DATA_DIR: path.resolve(str('DATA_DIR', path.join(process.cwd(), 'data'))),

@@ -16,10 +16,11 @@ let throttleSweep = null;
 let shuttingDown = false;
 
 function addresses() {
-  const out = [['local', `http://localhost:${config.PORT}`]];
+  const scheme = config.TLS_CERT_FILE && config.TLS_KEY_FILE ? 'https' : 'http';
+  const out = [['local', `${scheme}://localhost:${config.PORT}`]];
   for (const list of Object.values(os.networkInterfaces())) {
     for (const iface of list || []) {
-      if (iface.family === 'IPv4' && !iface.internal) out.push(['lan', `http://${iface.address}:${config.PORT}`]);
+      if (iface.family === 'IPv4' && !iface.internal) out.push(['lan', `${scheme}://${iface.address}:${config.PORT}`]);
     }
   }
   return out;
