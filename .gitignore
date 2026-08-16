@@ -3,3 +3,9 @@ data/
 .env
 *.log
 .DS_Store
+
+# Working documents — roadmap, progress tracker, specs, design notes.
+# NOTE: the graded deliverables (REPORT, CONTRIBUTIONS, DEMO, screenshots)
+# must be un-ignored or relocated before submission — see P11.
+# docs/
+# progress.md
