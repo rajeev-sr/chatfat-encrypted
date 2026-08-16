@@ -29,17 +29,18 @@ result recorded here. "The code is written" is `🟡`.
 
 | | |
 |---|---|
-| **Current phase** | P0 — Baseline and guardrails |
-| **Phases complete** | 0 / 12 |
-| **Mandatory requirements met** | 0 / 6 |
-| **Last updated** | 16 Aug 2026 — roadmap authored, nothing implemented |
+| **Current phase** | P3 — Identity (Better Auth, email + password) |
+| **Phases complete** | 3 / 12 — P0, P1, P2 |
+| **Mandatory requirements met** | 2 / 6 — requirements 1 and 2 |
+| **Test suite** | 257 assertions green offline · 16 green against Neon |
+| **Last updated** | 16 Aug 2026 — P2 committed (871ebfb) |
 
 ### Mandatory requirements (PDF slide 23)
 
 | # | Requirement | Status | Closed by |
 |---|---|---|---|
-| 1 | Messages are stored in a database | ⬜ partial (nothing stored by default) | P1 |
-| 2 | A user receives previous chat history | ⬜ not met | P1 · P2 |
+| 1 | Messages are stored in a database | ✅ **met** — Neon, proven across a restart | P1 |
+| 2 | A user receives previous chat history | ✅ **met** — replay 50 + keyset scrollback | P1 · P2 |
 | 3 | Messages are not stored as plaintext | ⬜ partial (locked rooms only) | P4 |
 | 4 | Modification of a stored message is detected | ⬜ partial (content only) | P4 · P7 |
 | 5 | Each sender has a signing key pair | ⬜ not met | P5 |
@@ -50,80 +51,89 @@ result recorded here. "The code is written" is `🟡`.
 | | Decision | Chosen | Confirmed |
 |---|---|---|---|
 | D1 | Database | **Neon** serverless Postgres | ✅ user |
-| D2 | Signature algorithm | Ed25519, `ES256` fallback by feature detection | ⬜ pending |
-| D3 | Private key storage | Non-extractable `CryptoKey` in IndexedDB | ⬜ pending |
-| D4 | Authentication | **Better Auth** + Google OAuth | ✅ user |
-| D5 | Module system | ESM across `src/` (Better Auth is ESM-first) | ⬜ pending |
+| D2 | Signature algorithm | Ed25519, `ES256` fallback by feature detection | ✅ user |
+| D3 | Private key storage | Non-extractable `CryptoKey` in IndexedDB | ✅ user |
+| D4 | Authentication | **Better Auth**, email + password *(was Google OAuth; changed 16 Aug)* | ✅ user |
+| D5 | Module system | **CommonJS stays** — `require('better-auth')` works on Node 24 | ✅ verified |
 
 ---
 
 ## Phases
 
-### ⬜ P0 · Baseline and guardrails — *0.5 d*
+### ✅ P0 · Baseline and guardrails — *0.5 d*
 
-- [ ] `npm run test:all` green on a clean checkout
-- [ ] `docs/` created; `SPEC.md` + `design.html` ported from Lab 2
-- [ ] `.env.example` covering every variable in `src/config.js`
-- [ ] `docker-compose.yml` (app + local Postgres for offline work)
-- [ ] CI at `.github/workflows/ci.yml`, Node 22 + 24 matrix
-- [ ] `CHANGELOG.md` and `docs/CONTRIBUTIONS.md` started
-- [ ] Tag `v2.0.0-lab2`
-- [ ] **Establish the demo host's HTTPS story** — hostname / `<ip>.sslip.io` / Cloudflare Tunnel / none
-- [ ] **Verify egress** — `curl` Neon and `accounts.google.com` from the allotted host
+- [x] `npm run test:all` green on a clean checkout — 246 assertions before any change
+- [x] `docs/` populated — ROADMAP, progress, CONTRIBUTIONS, DESIGN-SYSTEM
+- [x] `.env.example` covering every variable in `src/config.js`
+- [x] `docker-compose.yml` (app + local Postgres for offline work)
+- [x] CI at `.github/workflows/ci.yml`, Node 22 + 24 matrix + audit + secret grep
+- [x] `CHANGELOG.md` and `docs/CONTRIBUTIONS.md` started
+- [x] Tag `v2.0.0-lab2` → points at 65a704d
+- [x] ~~HTTPS story~~ — **retired** by the D4 change to email + password
+- [ ] **Verify egress** — `curl` the Neon endpoint from the allotted host *(deferred: no allotted host yet)*
+- [x] README layout tree corrected — it referenced `docs/SPEC.md`, which never existed
 
-**Acceptance:** clean clone → `npm ci && npm run test:all` green, CI green, no broken README links,
-and a written answer to *"how does the demo host get HTTPS?"*
-**Evidence:** —
-
----
-
-### ⬜ P1 · Persistence on Neon — *1.0 d*
-
-- [ ] Neon project + database created; pooled connection string in `.env`
-- [ ] `sslmode=require` verified; `pg.Pool` connects
-- [ ] Versioned migration runner + `schema_version` table
-- [ ] `001_init.sql` — messages, rooms, chain tables
-- [ ] `PgRepo` becomes the default path; `memory` retained for offline tests
-- [ ] `HISTORY_REPLAY` default `0 → 50`
-- [ ] `DEFAULT_ROOMS` seeded from config, not `data/rooms.json`
-- [ ] Neon branch per CI run (`neonctl branch create`)
-- [ ] Restart test in `test/persistence.js`
-- [ ] Cold-start note in README (free tier scales to zero)
-
-**Acceptance:** send → restart server → history returns; rows visible in the Neon SQL editor.
-**Evidence:** —
+**Acceptance:** clean clone → `npm ci && npm run test:all` green, no broken README links.
+**Evidence:** 246 assertions green at commit 39fa9d7. CI not yet observed on a push — GitHub
+Actions has not run against this branch. HTTPS question retired rather than answered.
 
 ---
 
-### ⬜ P2 · History as a real experience — *1.0 d*
+### ✅ P1 · Persistence on Neon — *1.0 d*
 
-- [ ] Keyset pagination — `repository.before(roomId, cursor, limit)` on `(ts, id)`
-- [ ] `history:more` frame, bounded and rate-limited
-- [ ] Infinite scrollback with preserved scroll anchor
-- [ ] Date separators at day boundaries
-- [ ] Unread divider at last-left position
-- [ ] Skeleton / empty / error states
+- [x] Neon project + database; pooled endpoint (`-pooler`) confirmed, `sslmode=require`
+- [x] Versioned migration runner + `schema_version` table with checksums
+- [x] `001_init.sql`
+- [x] `PgRepo` is the default path; `memory` retained for offline suites
+- [x] `HISTORY_REPLAY` default `0 → 50`
+- [x] `DEFAULT_ROOMS` seeded from config *(already true in `directory.load`; verified, not changed)*
+- [x] Restart test — in `test/postgres.js`, not `persistence.js`: it needs durable storage
+- [x] Cold-start note in README, plus the `pg` sslmode warning
+- [ ] Neon branch per CI run (`neonctl branch create`) *(deferred to P11 with CI setup)*
 
-**Acceptance:** 500-message room pages back in 50s, no scroll jump, separators correct across midnight.
-**Evidence:** —
+**Acceptance:** send → restart server → history returns; rows visible in Neon.
+**Evidence:** ✅ `test/postgres.js` 16/16 against the real Neon database. "written before the
+restart" written on boot 1, read back on boot 2 with text and sender intact, room directory
+survived. Row confirmed by direct SQL — **and readable as plaintext, which is the "before"
+picture for P4.**
 
 ---
 
-### ⬜ P3 · Identity — Better Auth + Google OAuth — *1.0 d*
+### ✅ P2 · History as a real experience — *1.0 d*
 
-- [ ] `require('better-auth')` interop verified on Node 24 (else D5: ESM conversion)
-- [ ] Google Cloud OAuth client; redirect URIs for localhost **and** the deployed host
-- [ ] Better Auth configured with the Neon pool adapter
+- [x] Keyset pagination — `repository.before(roomId, cursor, limit)` on `(ts, id)`, all 3 repos
+- [x] `history:more` / `history:page` frames, bounded by `HISTORY_PAGE`, rate-limited
+- [x] Infinite scrollback with preserved scroll anchor
+- [x] Date separators — rebuilt wholesale after a prepend (`rebuildDays`)
+- [x] Loading / done / error-with-retry states (`.cf-histtop`)
+- [x] Empty vs absent history distinguished in copy
+- [ ] Unread divider at last-left position *(not done — deferred, cosmetic)*
+
+**Acceptance:** pages back cleanly, no scroll jump, no duplicate at a page boundary.
+**Evidence:** ✅ 12 messages at 5/page reassemble to exactly `m0..m11` in order, both on the
+memory repo and against Neon (`test/postgres.js`). Malformed cursor refused with `NAME_INVALID`.
+**Not verified:** the 500-message figure and the scroll-anchor behaviour itself — both need a
+browser, and no browser check was run for P2.
+
+---
+
+### 🟡 P3 · Identity — Better Auth, email + password — *1.0 d*
+
+- [x] `require('better-auth')` interop verified on Node 24 — **works, no ESM conversion needed**
+- [x] ~~Google OAuth client~~ — removed by the D4 change
+- [ ] Better Auth configured with the Neon pool adapter, `emailAndPassword` enabled
 - [ ] Better Auth schema migrated (`user`, `session`, `account`, `verification`)
 - [ ] `toNodeHandler` mounted at `/api/auth/*` in `src/transport/http.js`
 - [ ] Old `src/auth/{index,stores}.js` scrypt path retired; `users`/`sessions` tables dropped
 - [ ] WebSocket upgrade authenticates from the **session cookie**, not a payload token
 - [ ] `localStorage` bearer token removed from `public/client.js`
 - [ ] `session.userId` is a stable account id — it becomes `sender_id` everywhere
-- [ ] Join screen rebuilt around "Continue with Google"
+- [ ] `SameSite=Strict` (available now that no OAuth redirect must survive a cross-site nav)
+- [ ] Join screen posts to `/api/auth/*`; email + password + register/sign-in toggle
 - [ ] `test/auth.js` rewritten against the new flow
 
-**Acceptance:** Google sign-in works end to end; the WS connection authenticates with no token in JS-readable storage; `sender_id` is a verified Google identity.
+**Acceptance:** register + sign in work end to end; the WS authenticates from the cookie with no
+token in JS-readable storage; `sender_id` is a stable account id that `/nick` cannot change.
 **Evidence:** —
 
 ---
@@ -273,12 +283,14 @@ and a written answer to *"how does the demo host get HTTPS?"*
 
 | | Item | Needs | Raised |
 |---|---|---|---|
-| 1 | **How does the allotted host get HTTPS?** Google OAuth is unusable without it | Hostname, `<ip>.sslip.io`, or a Cloudflare Tunnel — answer in **P0** | 16 Aug |
-| 2 | **Does the allotted host have egress to Neon and Google?** | `curl` both from that machine in **P0**; if blocked, self-host Postgres + keep a password provider | 16 Aug |
-| 3 | D2, D3, D5 unconfirmed | A decision from the team | 16 Aug |
-| 4 | Google OAuth client credentials | A Google Cloud project | before P3 |
-| 5 | Neon connection string | A Neon project | before P1 |
-| 6 | P11 deliverables live in `docs/` | Confirm `git ls-files docs/` lists them before submission | 16 Aug |
+| 1 | ~~HTTPS on the allotted host~~ | **RETIRED** — D4 moved off OAuth, nothing in auth needs TLS | closed 16 Aug |
+| 2 | ~~Google OAuth credentials~~ | **RETIRED** — no longer used | closed 16 Aug |
+| 3 | ~~D2, D3, D5 unconfirmed~~ | **CLOSED** — D2/D3 confirmed by the team, D5 verified empirically | closed 16 Aug |
+| 4 | ~~Neon connection string~~ | **CLOSED** — supplied, working, 16/16 assertions against it | closed 16 Aug |
+| 5 | **Egress from the allotted host to Neon** | `curl` from that machine once one exists. Still open only because there is no allotted host yet | 16 Aug |
+| 6 | **CI has never actually run** | Push to GitHub and confirm the workflow goes green. Written but unobserved | 16 Aug |
+| 7 | P11 deliverables live in `docs/` | Confirm `git ls-files docs/` lists them before submission | 16 Aug |
+| 8 | **Design-system handoff items unapplied** | 5 `index.html` edits from the agent's `DESIGN-SYSTEM.md` §9 | 16 Aug |
 
 ---
 
@@ -307,3 +319,43 @@ and a written answer to *"how does the demo host get HTTPS?"*
 - Also added: standard-crypto-library compliance statement (slides 7, 17), the `nonce`/`ar_iv`
   vocabulary note (slide 20), and a decision to keep polls in-memory rather than persisted.
 - **Nothing implemented yet.** Next: P0.
+
+### 16 Aug 2026 — execution begins
+
+**P0 done** (39fa9d7). Baseline verified green *before* touching anything: 246 assertions.
+`.env.example`, `docker-compose.yml`, CI (test matrix + audit + secret grep), CHANGELOG,
+CONTRIBUTIONS, tag `v2.0.0-lab2`. Corrected the README's layout tree, which advertised a
+`docs/SPEC.md` that has never existed in this repo or in Lab 2's.
+
+**P1 done** (8fa0708). Requirement 1 met and proven. Versioned migrations with checksums and an
+advisory lock; `HISTORY_REPLAY` 0 → 50; an unset `DATABASE_URL` now refuses to boot instead of
+silently discarding every message, with `DATABASE_URL=none` kept as the explicit off switch.
+`test/postgres.js` proves a message survives a restart against real Neon.
+
+**P2 done** (871ebfb). Requirement 2 met. Keyset pagination on `(ts, id)` — never `OFFSET`, and
+never `ts` alone, since messages routinely share a millisecond. Scroll anchor preserved on
+prepend; day separators rebuilt wholesale because a prepended page invalidates the separator
+above the previously-oldest message.
+
+**A real bug the phase surfaced.** `pg_advisory_lock` was wrong twice over: a session-level lock
+outlives a client killed with SIGKILL, so every later boot blocked forever on a lock nobody held —
+and Neon's pooled endpoint is PgBouncer in transaction mode, where a lock taken on one backend and
+released on another is not a lock at all. Now `pg_advisory_xact_lock` in one transaction with
+`lock_timeout`. Found because the test suite wedged; would have been found in production otherwise.
+
+**A test bug worth recording too.** The first pagination failure against Neon looked like an
+off-by-one and was not: writes are detached from the hot path, so twelve sequential inserts to
+us-east-2 outlast a 500 ms sleep. The suite now waits for *durability* rather than for the echo.
+
+**D5 resolved empirically:** `require('better-auth')` works on Node 24 and `better-auth/node`
+exports `toNodeHandler`. No ESM conversion — that was the plan's highest-rated risk.
+
+**D4 changed by the team:** email + password instead of Google OAuth. This retires the HTTPS
+blocker and halves the egress risk. Cost, stated in the roadmap and to be repeated in the report:
+password hashes are ours again, and there is no email verification.
+
+**Design system delivered** by a parallel agent — `public/style.css` rewritten, real font binaries
+in `public/fonts/`, `docs/DESIGN-SYSTEM.md` with a 146-pairing contrast audit, 0 failing. Five
+`index.html` handoff items are **not yet applied** (blocker 8).
+
+Next: P3.

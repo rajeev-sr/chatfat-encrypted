@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The three credentials this project handles. .env is gitignored; this
+      # The two credentials this project handles. .env is gitignored; this
       # catches the day somebody force-adds it or pastes a key into a source
       # file. .env.example is excluded — it holds only placeholders.
       - name: grep for credential shapes
@@ -94,6 +94,8 @@ jobs:
             fi
           }
           check 'postgresql://[^ "'"'"']*:[^ "'"'"']*@[^ "'"'"']*neon\.tech' 'Neon connection string'
-          check '[0-9]{10,}-[a-z0-9]{20,}\.apps\.googleusercontent\.com' 'Google OAuth client id'
-          check 'GOCSPX-[A-Za-z0-9_-]{20,}' 'Google OAuth client secret'
+          # No negative lookahead — that is PCRE and this is grep -E. It does
+          # not need one: .env.example is excluded above and .env is
+          # gitignored, so any long value in a tracked file is already wrong.
+          check '^BETTER_AUTH_SECRET=.{16,}' 'Better Auth session secret'
           exit $FOUND

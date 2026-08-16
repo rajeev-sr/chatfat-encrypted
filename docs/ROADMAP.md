@@ -49,7 +49,7 @@ if the evidence column is honest.
 | Source code | — | The repo |
 | PDF report | P11 | `docs/REPORT.md` → rendered |
 | Contribution report per member | P0 → P11 | `docs/CONTRIBUTIONS.md`, written as you go |
-| Working client URL on the allotted system | P11 | Deployment — **see Risk 4, HTTPS is a hard blocker** |
+| Working client URL on the allotted system | P11 | Deployment. *(The HTTPS blocker that used to sit here was retired by the D4 change to email + password.)* |
 | Public GitHub, all members as collaborators | P0 → P11 | Repo settings |
 | Screenshots / demo of persistence, tamper detection, signature verification | P11 | `docs/DEMO.md` steps 1, 3–5, 6 · `docs/screenshots/` |
 
@@ -61,7 +61,7 @@ Say all four of these in the report; each is a direct answer to slide 24.
 |---|---|---|
 | One server-side encryption layer | Two layers — at-rest **and** optional E2EE | Slide 6's model protects against a database thief but not against the operator |
 | A signature detects a modified row | A per-room **hash chain** | A signature says nothing about a row that was **deleted** or **reordered** — it can only speak about rows still present |
-| `sender` is a stored string | `sender_id` is a **Google-verified account**, bound into the AAD | Signing a self-declared username proves only that someone signed a string |
+| `sender` is a stored string | `sender_id` is an **immutable account id**, bound into the AAD | Signing a self-declared username proves only that somebody signed a string — and `/nick` can change a username |
 | Verify on read | Verify at **ingress, on read, and on render** | Verifying only server-side means trusting the server, which the E2EE layer explicitly refuses to do |
 
 ### Compliance with the crypto instructions (slides 7 and 17)
@@ -102,7 +102,7 @@ Being replaced:
 
 | Asset | Why |
 |---|---|
-| `src/auth/index.js` — hand-rolled scrypt hashing, register/login | Superseded by **Better Auth + Google OAuth** in P3. The scrypt work was correct; it is simply no longer the identity model. |
+| `src/auth/index.js` — hand-rolled scrypt hashing, register/login | Superseded by **Better Auth (email + password)** in P3. The scrypt work was correct; it is simply no longer the identity model. |
 | `src/auth/stores.js` — `MemoryStore \| PgStore` | Better Auth owns its own `user` / `session` / `account` tables. |
 | `localStorage` bearer tokens in `public/client.js` | Replaced by Better Auth's `HttpOnly; Secure; SameSite` session cookies. |
 
@@ -177,19 +177,39 @@ The existing `PgRepo` and `src/db/pool.js` already speak Postgres, so the code c
 - **Offline still works.** `DATABASE_URL=memory` keeps the existing `MemoryRepo` path alive for local work and for suites that must not need network. The one suite that genuinely needs durability — the restart test in P1 — runs against a Neon branch in CI.
 - **The connection string is a secret.** It goes in `.env` (gitignored), in GitHub Actions secrets, and nowhere else. It must never appear in `/healthz`, a log line, or an error message.
 
-**D4 · Authentication?** — ✅ **Settled: Better Auth with Google OAuth.**
-This replaces the hand-rolled scrypt path in `src/auth/`. Three things it buys, beyond convenience:
+**D4 · Authentication?** — ✅ **Settled: Better Auth with email + password.**
+*(Revised 16 Aug: was Google OAuth. Changed at the team's request — see the trade-off below.)*
 
-1. **`sender_id` becomes a verified identity.** Today a username is a claim. After P3 it is a Google account id, which is what makes a signature over `sender_id` mean something. This is why **P3 is sequenced before P4** — the AAD and the signature payload both bind `sender_id`, and binding a value whose meaning is about to change is wasted work.
+This replaces the hand-rolled scrypt path in `src/auth/`. What it buys:
+
+1. **`sender_id` becomes a stable account id.** Today a username is a claim that `/nick` can change. After P3 it is an immutable account primary key, which is what makes a signature over `sender_id` mean something. This is why **P3 is sequenced before P4** — the AAD and the signature payload both bind `sender_id`, and binding a value whose meaning is about to change is wasted work.
 2. **Session cookies replace `localStorage` bearer tokens** — `HttpOnly; Secure; SameSite`, so an XSS can no longer read the session. That was a P8 hardening item; Better Auth absorbs it.
-3. **No password storage at all.** The best way to not leak passwords is to not have any. Note in the report that this *moves* trust to Google rather than eliminating it — an honest framing beats a triumphant one.
+3. **Password handling stops being ours.** The existing scrypt code was correct, but it is code we maintain and code a marker has to trust. Better Auth's is audited, parameterised, and upgraded without us.
+
+**What changing away from OAuth costs, and what it buys.** Be straight about this in the report:
+
+| | Google OAuth | Email + password *(chosen)* |
+|---|---|---|
+| Password storage | none — nothing to leak | hashes on our side again; the blast radius of a database leak grows |
+| Identity strength | Google has verified the address | anyone can register any address; there is no email verification step unless we add one |
+| External dependency | needs `accounts.google.com` reachable **and HTTPS** | none — works on a firewalled LAN |
+| Demo risk | a misconfigured redirect URI kills the demo | nothing to misconfigure |
+
+The deciding factor is the third row. Google refuses non-HTTPS redirect URIs for every origin except
+`localhost`, which made a working demo on the allotted system contingent on obtaining a domain name
+and a certificate — a dependency with no bearing on any of the six mandatory requirements. Email and
+password removes it entirely. **This retires Risk 4 and Risk 5 outright.**
+
+The identity row is the honest cost, and there is a cheap mitigation worth taking: Better Auth
+supports `requireEmailVerification`, and leaving it off should be a stated decision in the threat
+model rather than an omission.
 
 Practical friction to plan for:
 - Better Auth is **ESM-first**. Node 24 can `require()` an ESM graph with no top-level await, so plain `require('better-auth')` may just work — **verify this in the first hour of P3**. If it does not, see D5.
-- It brings its own schema (`user`, `session`, `account`, `verification`) and its own migration command. The old `users` and `sessions` tables get dropped.
+- It brings its own schema (`user`, `session`, `account`, `verification`). The old `users` and `sessions` tables get dropped. `account` still exists in an email/password setup — it is where the credential lives.
 - It mounts as a request handler; `better-auth/node`'s `toNodeHandler` fits the project's raw `node:http` server at `/api/auth/*`.
-- **Google OAuth needs registered redirect URIs.** Add `http://localhost:3000/api/auth/callback/google` now and the deployed origin in P11. Google permits `localhost` over plain HTTP; every other origin must be HTTPS, which couples P3's completion to P8's TLS work for the hosted demo.
 - **The WebSocket upgrade must authenticate from the cookie.** `src/transport/websocket.js` currently lets any socket connect and waits for a `join` frame carrying a token. After P3 the upgrade handler parses the session cookie and rejects unauthenticated upgrades before the socket ever opens.
+- `SameSite=Lax` was chosen for the OAuth redirect. With no redirect in the flow, **`SameSite=Strict` is now available and strictly better** — take it.
 
 **D2 · Which signature algorithm?** — ⬜ *Recommended:* Ed25519 when the browser's WebCrypto supports it, ECDSA P-256 + SHA-256 (`ES256`) as the fallback, chosen by feature detection at key-generation time. Node verifies both (confirmed locally). The envelope carries `sig_alg`, so the choice is per-key rather than per-server. `ES256` alone is the zero-risk option — universally supported, and already the curve `public/crypto.js` uses for whisper ECDH.
 
@@ -221,8 +241,7 @@ The point is that every later phase is *verifiable*. Do not skip this to "save t
 | CI: `.github/workflows/ci.yml` | Node 22 + 24 matrix, `npm ci`, `npm run test:all`. A green badge in the README is free professionalism |
 | `CHANGELOG.md`, `docs/CONTRIBUTIONS.md` | Start both now; they become half of P11 |
 | Tag `v2.0.0-lab2` | So the diff you present in the report is exactly "what Lab 4 added" |
-| **Establish the demo host's HTTPS story** | Google OAuth is unusable without it (Risk 4). Find out *now* whether the allotted system has a hostname, can use `<ip>.sslip.io`, can run a Cloudflare Tunnel, or none of the above. This single answer decides whether P3 is straightforward or needs a fallback path, and finding out in P11 is too late |
-| **Verify egress from the allotted host** | `curl` Neon and `accounts.google.com` from the machine that will serve the demo. If either is blocked (Risk 5), self-host Postgres via `docker-compose.yml` and keep an email/password provider alongside Google |
+| **Verify egress from the allotted host** | `curl` the Neon endpoint from the machine that will serve the demo. If it is blocked, self-host Postgres via `docker-compose.yml`. *(The HTTPS question that used to live here was retired by the D4 change — no part of the auth path needs TLS now.)* |
 
 **Acceptance:** clean clone → `npm ci && npm run test:all` green, CI green on a pushed branch, no broken links in `README.md`.
 
@@ -266,25 +285,25 @@ Requirement 2 is satisfied by a `SELECT`, but the marks for UX are not. Slide 5'
 
 ---
 
-### Phase 3 · Identity — Better Auth + Google OAuth
+### Phase 3 · Identity — Better Auth, email + password
 **~1 day · Prerequisite for P4, P5 and P6**
 
 Sequenced here deliberately: `sender_id` is bound into the at-rest AAD (P4) and into the signature payload (P6). Settle what `sender_id` *means* before either of those is written.
 
 | Task | Detail |
 |---|---|
-| Interop check *(do this first)* | Try `require('better-auth')` on Node 24. If it throws, take D5 and convert `src/` to ESM before writing any auth code — that ordering matters, because converting afterwards means touching every file you just wrote |
-| Google Cloud OAuth client | Consent screen, client id + secret. Redirect URIs: `http://localhost:3000/api/auth/callback/google` now, the deployed origin added in P11 |
-| Better Auth config | Google as the social provider, Neon pool as the database adapter, session lifetime, cookie flags `HttpOnly; Secure; SameSite=Lax` (Lax, not Strict — Strict breaks the OAuth redirect) |
+| Interop check *(do this first)* | ✅ **Resolved 16 Aug: `require('better-auth')` works on Node 24**, and `better-auth/node` exports `toNodeHandler` and `fromNodeHeaders`. No ESM conversion needed; D5 does not fire |
+| Better Auth config | `emailAndPassword: { enabled: true }`, Neon pool as the database adapter, session lifetime, cookie flags `HttpOnly; Secure; SameSite=Strict` — Strict is available now that no OAuth redirect has to survive a cross-site navigation |
+| Password policy | Better Auth's `minPasswordLength`. Keep the existing 8–200 range from `config.MIN_PASSWORD`/`MAX_PASSWORD` so the client-side copy stays true |
 | Schema migration | Better Auth generates `user`, `session`, `account`, `verification`. Fold it into the P1 migration runner as `003_betterauth.sql` so there is one migration story, not two |
 | Mount the handler | `toNodeHandler` from `better-auth/node` at `/api/auth/*` in `src/transport/http.js`, above the static-file branch |
 | Retire the old path | Delete `src/auth/index.js` and `src/auth/stores.js`; drop the old `users` and `sessions` tables in a migration. Keep the *timing-parity* comment somewhere in the report — it was a good idea and it is worth showing you understood why |
 | **Authenticate the upgrade** | `src/transport/websocket.js` parses the session cookie in the `upgrade` handler and rejects unauthenticated sockets with `401` before the connection opens. The `join` frame stops carrying a token entirely |
-| Client rework | The join screen becomes "Continue with Google". Remove `LS.token`, the `/auth/*` fetches, and the token-resume path from `public/client.js` |
-| Identity in the hub | `session.userId` is the Better Auth user id and becomes the canonical `sender_id`. Display name and avatar come off the Google profile; `/nick` becomes a display-name preference, never an identity change |
-| `test/auth.js` rewritten | Sign-in, session resume, expired session, unauthenticated upgrade rejected, and — still — impersonation refused |
+| Client rework | The join screen keeps its shape — email, password, and a register/sign-in toggle — but posts to `/api/auth/*` and stops storing anything. Remove `LS.token`, the old `/auth/*` fetches, and the token-resume path from `public/client.js` |
+| Identity in the hub | `session.userId` is the Better Auth user id and becomes the canonical `sender_id`. The display name is a separate, mutable field; `/nick` changes it and never touches identity — which is exactly why author checks are on `fromId` and not `from` |
+| `test/auth.js` rewritten | Register, sign in, session resume, wrong password, expired session, unauthenticated upgrade rejected, and — still — impersonation refused |
 
-**Acceptance:** Google sign-in works end to end; the WebSocket authenticates with no token in JS-readable storage; `sender_id` is a verified Google account id.
+**Acceptance:** register and sign in work end to end; the WebSocket authenticates from the cookie with no token in JS-readable storage; `sender_id` is a stable account id that `/nick` cannot change.
 
 ---
 
@@ -319,20 +338,20 @@ same already-planned treatment covers `/unsend`. **Nothing in the message table 
 ### Phase 5 · Sender signing keys
 **~1.5 days · Closes requirement 5**
 
-The requirement is one sentence; doing it *correctly* is where most submissions fall down, because a public key nobody verified proves nothing. Google has authenticated the *account*; nothing yet authenticates the *device*.
+The requirement is one sentence; doing it *correctly* is where most submissions fall down, because a public key nobody verified proves nothing. Better Auth has authenticated the *account*; nothing yet authenticates the *device*.
 
 | Task | Detail |
 |---|---|
 | `public/js/identity.js` | Generate a non-extractable keypair (Ed25519, else ES256 — D2), store the `CryptoKey` in IndexedDB (D3) |
 | `key_id` | `base64url(SHA-256(spki))`, truncated to 16 chars for display |
 | **Proof of possession** | Registration is not "here is my public key". Server issues a 32-byte challenge bound to the Better Auth session; client returns `sign("chatfat-key-reg-v1" ‖ user_id ‖ key_id ‖ challenge)`; server verifies **before** storing. Without this, any authenticated user can plant a key under any account |
-| `device_keys` table | `(key_id PK, user_id → user.id, alg, spki, label, created_at, revoked_at)`. One Google account, many browsers — a real system does not assume one device |
+| `device_keys` table | `(key_id PK, user_id → user.id, alg, spki, label, created_at, revoked_at)`. One account, many browsers — a real system does not assume one device |
 | `GET /keys/:user` | Public key lookup, cached client-side |
 | **Safety numbers** | Render the fingerprint as five groups of five digits, plus a QR. Two members compare out of band. Worth saying in the report that TOFU is a *choice*, not an oversight |
 | Key-change warning | If a sender's `key_id` differs from the one this client saw before → a **loud** banner, not a subtle badge. This is the attack that matters |
 | Revocation | `POST /keys/:key_id/revoke` (authenticated). Messages signed before `revoked_at` stay valid; after, they do not |
 
-**Acceptance:** two browsers signed into two Google accounts show matching fingerprints under manual comparison; a key planted by `curl` with a valid session but no valid proof of possession is rejected with `403`.
+**Acceptance:** two browsers signed into two accounts show matching fingerprints under manual comparison; a key planted by `curl` with a valid session but no valid proof of possession is rejected with `403`.
 
 ---
 
@@ -406,13 +425,13 @@ Better Auth already took the cookie and CSRF work off this list in P3. What rema
 
 | Task | Detail |
 |---|---|
-| **TLS / `wss://`** | Caddy or nginx in front, Let's Encrypt on the allotted host. Required, not optional: Google OAuth refuses non-HTTPS redirect URIs for anything but `localhost`. The client already derives `wss://` from `location.protocol` |
+| **TLS / `wss://`** | Caddy or nginx in front, Let's Encrypt on the allotted host. No longer a hard blocker since D4 moved off OAuth, but still the difference between a demo and a secure system: without it, session cookies and passwords cross the network in the clear. The client already derives `wss://` from `location.protocol` |
 | **CSP** | `default-src 'self'; script-src 'self'; connect-src 'self' wss:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'`. The inline theme script in `index.html` needs a nonce or a move to an external file; self-hosted fonts in `public/fonts/` need `font-src 'self'` |
 | Security headers | HSTS, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Permissions-Policy` |
 | Rate limiting | Extend the existing token bucket to `history:more`, key registration, and key lookups |
-| Secret hygiene | `MASTER_KEY`, `DATABASE_URL` and the Google client secret never logged, never in `/healthz`, never in an error message. A pre-commit grep in CI |
+| Secret hygiene | `MASTER_KEY`, `DATABASE_URL` and `BETTER_AUTH_SECRET` never logged, never in `/healthz`, never in an error message. A pre-commit grep in CI |
 | Dependency audit | `npm audit` in CI; pin `ws`, `pg` and `better-auth`; `npm ci --omit=dev` in the Dockerfile (already correct) |
-| `docs/THREAT-MODEL.md` | Adversaries (passive network, malicious operator, **Neon compromise or a leaked connection string**, compromised member, XSS, a malicious Google), what each layer stops, **and what none of them stop**. The README's "what it protects / what it does not" table is already the right shape — extend it |
+| `docs/THREAT-MODEL.md` | Adversaries (passive network, malicious operator, **Neon compromise or a leaked connection string**, compromised member, XSS, a stolen password), what each layer stops, **and what none of them stop**. The README's "what it protects / what it does not" table is already the right shape — extend it |
 
 **Acceptance:** `https://` + `wss://` end to end, a header check with no criticals, and a threat-model doc that names at least one thing the system genuinely does not protect against.
 
@@ -476,13 +495,13 @@ Also in this pass: a radius scale (organic means *consistently* soft, not random
 |---|---|
 | **Security Center** | One panel answering, live, for the current room: at-rest `on · kv2` · E2EE `on` + fingerprint · signatures `142 verified, 0 failed` · chain `intact to seq 142` · your device key and safety number. **This is the screen you demo and screenshot** |
 | Per-message verification badge | Quiet when verified, unmissable when not. On hover or focus: "Signed by Rahul · key 3f9a…c1 · verified in your browser" |
-| Identity & devices screen | Your Google account, your device keys, last used, revoke. Plus a "verify a contact" safety-number comparison flow |
+| Identity & devices screen | Your account, your device keys, last used, revoke. Plus a "verify a contact" safety-number comparison flow |
 | Accessibility | Full keyboard path through every flow, visible focus rings, `aria-live` extended to verification-state changes, `prefers-reduced-motion` honoured, contrast audited in both themes |
 | Responsive | The roster already collapses; audit 360 px, and make modals bottom-sheets under 640 px |
 | Every state designed | loading · empty · error · offline · reconnecting · rate-limited · tampered. The reconnect path exists in `client.js`; give it a real interface |
 | Onboarding | First run: three steps explaining what is encrypted, what is signed, and what is still visible. Honesty as a feature |
 
-**Acceptance:** Lighthouse accessibility ≥ 95; a keyboard-only walkthrough from Google sign-in to a verified contact in a locked room; no off-scale type sizes or unlisted colours anywhere in `style.css`; and a security state a non-technical grader can read at a glance.
+**Acceptance:** Lighthouse accessibility ≥ 95; a keyboard-only walkthrough from sign-in to a verified contact in a locked room; no off-scale type sizes or unlisted colours anywhere in `style.css`; and a security state a non-technical grader can read at a glance.
 
 ---
 
@@ -493,15 +512,14 @@ Also in this pass: a radius scale (organic means *consistently* soft, not random
 |---|---|
 | **Verify the deliverables are tracked** | `git ls-files docs/` must list `REPORT`, `CONTRIBUTIONS`, `DEMO`, `THREAT-MODEL`, the ADRs and the screenshots. If `docs/` is ignored at that point, narrow the rule to `docs/ROADMAP.md` and `docs/progress.md` only. **This is a marks-losing detail if forgotten** |
 | **Hosted client URL** | Deploy to the allotted system. `docker-compose up -d` behind Caddy with TLS, health check, restart policy, log rotation. `DATABASE_URL` points at Neon; `MASTER_KEY` from the host's environment, never the image |
-| **Google OAuth production redirect** | Add the deployed origin to the OAuth client before the demo, not during it |
-| **`docs/DEMO.md`** | A 6-minute script with exact commands, so the recording is one take: **(1)** send messages, restart the server, history returns · **(2)** open the Neon SQL editor, show ciphertext where the text should be · **(3)** `tools/tamper.js --flip-ciphertext`, reload, tamper card appears · **(4)** `--rewrite-sender`, signature fails even though the ciphertext is untouched · **(5)** `tools/audit.js` exiting non-zero · **(6)** two Google accounts comparing safety numbers |
+| **`docs/DEMO.md`** | A 6-minute script with exact commands, so the recording is one take: **(1)** send messages, restart the server, history returns · **(2)** open the Neon SQL editor, show ciphertext where the text should be · **(3)** `tools/tamper.js --flip-ciphertext`, reload, tamper card appears · **(4)** `--rewrite-sender`, signature fails even though the ciphertext is untouched · **(5)** `tools/audit.js` exiting non-zero · **(6)** two accounts comparing safety numbers |
 | **Screenshots / video** | The three the PDF names — persistence, tamper detection, signature verification — plus the Security Center. In `docs/screenshots/` |
 | **PDF report** | Write `docs/REPORT.md`, render via the `docs/report.html` pattern from Lab 2. **Open with the compliance matrix from §0.1** — requirement, phase, implementing file, proving test — so the grader can tick six boxes on page one. Then: problem · threat model · the three layers and why one is not enough · why identity had to come before encryption · schema and the AAD rule · **the sign/encrypt ordering answer from P6** · signature payload construction and why not `JSON.stringify` · verification at three points · **the standard-library compliance statement (slides 7 and 17)** · the `nonce`/`ar_iv` vocabulary note · what we do **not** protect against · results and load figures |
 | **Contribution report** | `docs/CONTRIBUTIONS.md` — per member, with commit ranges. Write it as you go; `git shortlog -sne` is evidence |
 | **GitHub** | Public repo, **every member added as a collaborator** (asked for explicitly), protected `main`, CI badge, `LICENSE`, a README opening with a screenshot |
 | Load figures | `npm run loadtest` before and after the crypto work. "Signing added 1.8 ms p95 at 64 clients" is a sentence that earns marks. Note that Neon adds network latency to the *write* path, not the broadcast path — the fan-out numbers should be unchanged, and saying so shows you understood your own architecture |
 
-**Acceptance:** a stranger can open the URL, sign in with Google, read the README, and reproduce the tamper demo in under five minutes.
+**Acceptance:** a stranger can open the URL, register an account, read the README, and reproduce the tamper demo in under five minutes.
 
 ---
 
@@ -583,12 +601,11 @@ CREATE TABLE reactions (
 | Signature payload not byte-reproducible across browser and Node | **High** | The canonical length-prefixed encoder is written **once**, shared verbatim between `public/js/` and `src/crypto/`, and has its own round-trip test as the first thing built in P6 |
 | Crypto work lands but the paperwork does not | **High** | P11 is a phase with an estimate, not a "we'll do it Sunday". `CHANGELOG.md` and `CONTRIBUTIONS.md` start in P0 |
 | **Better Auth ESM/CJS interop bites mid-phase** | **High** | The interop check is the *first* task in P3, before any auth code is written. If it fails, convert to ESM immediately (D5) rather than working around it |
-| **The allotted system has no domain name, so Google OAuth cannot work** | **High** | Google refuses non-HTTPS redirect URIs for every origin except `localhost`, and Let's Encrypt will not issue for a bare IP. **Resolve this in P0, not P11** — establish which of these you have: a real hostname; a wildcard-DNS name such as `<ip>.sslip.io` (publicly resolvable, so an HTTP-01 challenge succeeds if port 80 is reachable); a free DuckDNS subdomain; or a Cloudflare Tunnel, which terminates TLS for you and needs no inbound ports. If none is possible, fall back to the local-account path (below) for the hosted demo and show Google sign-in on `localhost` in the video |
-| **The lab network blocks egress, so Neon and Google are both unreachable** | **High** | The architecture now has two hard external dependencies where Lab 2 had none — a firewalled lab LAN takes the whole app down, not one feature. **Keep an offline path alive and test it weekly:** `DATABASE_URL=memory` plus a retained email/password provider in Better Auth. Verify egress from the allotted host in P0; if it is blocked, self-host Postgres via the P0 `docker-compose.yml` and make local accounts the primary path |
+| ~~The allotted system has no domain name, so Google OAuth cannot work~~ | **RETIRED** | Removed by the D4 change to email + password on 16 Aug. Nothing in the auth path needs HTTPS or a registered redirect URI any more. TLS remains a P8 goal for the transport, but it is no longer a hard blocker on a working demo |
+| **The lab network blocks egress, so Neon is unreachable** | **Medium** *(was High)* | Halved by the D4 change — Google is no longer a dependency, so only the database is. A firewalled LAN still takes storage down. Mitigation unchanged: verify egress from the allotted host in P0, and keep the `docker-compose.yml` Postgres path working as the offline fallback |
 | A legitimate burn or unsend breaks the hash chain and `audit.js` reports false tampering | Medium | Resolved by design in P4 — nothing in `messages` is ever `DELETE`d. P7 carries the inverse test: burn a message, assert the audit still exits **zero** |
 | Rows written in P1–P3 are plaintext and unsigned, leaving a mixed table | Medium | Explicit backfill decision in P4 — truncate, or seal legacy rows under `sig_alg = 'none'` so they render *unverified* rather than *forged*. Writing it down is the requirement; either choice is defensible |
 | **Graded deliverables live in `docs/` and never reach the public repo** | Medium | `git ls-files docs/` is the first checklist item in P11; the ignore rule carries a comment pointing at it |
-| Google OAuth redirect misconfigured at demo time | Medium | Register the production URI in P11 as a named task, and rehearse sign-in on the deployed host before recording |
 | Neon cold start makes the demo look broken | Medium | Free tier scales to zero. Hit `/healthz` before recording; document the behaviour in the README |
 | Neon connection string leaks into a log or a commit | Medium | `.env` gitignored, secrets in GitHub Actions, pre-commit grep in P8, and `/healthz` audited for it |
 | WebCrypto Ed25519 missing on a lab machine | Medium | Feature-detect at key generation, fall back to `ES256`, carry `sig_alg` per key |
@@ -631,4 +648,4 @@ Phases 0–2 are shared groundwork; after that the work parallelises cleanly alo
 
 Worth drafting now, because it shapes what you build:
 
-> No system is secure in the abstract — only against a named adversary. This one **encrypts at rest**, so a leaked Neon connection string yields ciphertext and metadata but never message text; it **signs every message** with a per-device key, so a forged or altered row is detectable; it **chains rows per room**, so a deletion or a reordering is detectable too; it **authenticates senders through Google**, so `sender_id` is a verified identity rather than a claim; and for rooms that opt in, it **encrypts end to end**, so the operator sits outside the trust boundary. It does **not** protect metadata — who is in which room, when, and how often is visible to the server in every mode. It does not protect against a member of the room, who has the key by definition. It does not protect against a compromised browser. It moves password trust to Google rather than eliminating it. And the honest weak point is key distribution: the first time you see someone's device key, you trust it, and only an out-of-band comparison of safety numbers turns that trust into verification. Each of those is a deliberate boundary, documented in `docs/THREAT-MODEL.md` — and naming them is what makes the rest of the claims credible.
+> No system is secure in the abstract — only against a named adversary. This one **encrypts at rest**, so a leaked Neon connection string yields ciphertext and metadata but never message text; it **signs every message** with a per-device key, so a forged or altered row is detectable; it **chains rows per room**, so a deletion or a reordering is detectable too; it **authenticates senders through accounts**, so `sender_id` is an immutable identity rather than a claim a rename can move; and for rooms that opt in, it **encrypts end to end**, so the operator sits outside the trust boundary. It does **not** protect metadata — who is in which room, when, and how often is visible to the server in every mode. It does not protect against a member of the room, who has the key by definition. It does not protect against a compromised browser. It stores password hashes, so a database leak is worse for accounts than it is for message content. And the honest weak point is key distribution: the first time you see someone's device key, you trust it, and only an out-of-band comparison of safety numbers turns that trust into verification. Each of those is a deliberate boundary, documented in `docs/THREAT-MODEL.md` — and naming them is what makes the rest of the claims credible.
