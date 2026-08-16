@@ -1,0 +1,75 @@
+// src/config.js — every tunable in the system. This is the ONLY module that
+// reads process.env; everything else imports what it needs from here, so the
+// set of things that can change behaviour is one file long.
+'use strict';
+
+require('./env').load();
+
+const path = require('node:path');
+
+const str = (k, dflt) => (process.env[k] === undefined || process.env[k] === '' ? dflt : String(process.env[k]));
+const int = (k, dflt, min = 0, max = Number.MAX_SAFE_INTEGER) => {
+  const n = Number.parseInt(process.env[k], 10);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.min(max, Math.max(min, n));
+};
+const bool = (k, dflt) => {
+  const v = process.env[k];
+  if (v === undefined || v === '') return dflt;
+  return !(v === '0' || v.toLowerCase() === 'false' || v.toLowerCase() === 'off');
+};
+
+const DATABASE_URL = str('DATABASE_URL', '');
+const PERSISTENCE_ENABLED = !!DATABASE_URL;
+const USE_POSTGRES = PERSISTENCE_ENABLED && DATABASE_URL !== 'memory';
+
+module.exports = {
+  // — environment —
+  PORT: int('PORT', 3000, 1, 65535),
+  HOST: str('HOST', '0.0.0.0'),
+  ALLOWED_ORIGINS: str('ALLOWED_ORIGINS', '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean),
+  DATABASE_URL,
+  DATA_DIR: path.resolve(str('DATA_DIR', path.join(process.cwd(), 'data'))),
+  // The minimum here is 0, not 1 — otherwise the off switch fails quietly.
+  HISTORY_REPLAY: int('HISTORY_REPLAY', 0, 0, 200),
+  HISTORY_CAP: int('HISTORY_CAP', 200, 10, 5000),
+  MAX_ROOMS: int('MAX_ROOMS', 24, 1, 500),
+  HEARTBEAT_MS: int('HEARTBEAT_MS', 15000, 1000),
+  AUTH_MAX_ATTEMPTS: int('AUTH_MAX_ATTEMPTS', 10, 1),
+  ENCRYPTION_ENABLED: bool('ENCRYPTION_ENABLED', true),
+  MAX_CIPHERTEXT: int('MAX_CIPHERTEXT', 12288, 1024, 1024 * 1024),
+
+  // — derived: accounts and storage move together —
+  PERSISTENCE_ENABLED,
+  USE_POSTGRES,
+  AUTH_ENABLED: PERSISTENCE_ENABLED,
+
+  // — compile-time constants —
+  PROTOCOL_VERSION: 2, // bumped from 1 by the encryption work (SPEC §14.10)
+  // 32 KB, not 8: a 12 KB ciphertext base64-expands to ~16 KB and still has to
+  // fit inside a frame. Leave this at 8 KB and every encrypted message closes
+  // the socket (SPEC §17.3.14).
+  MAX_PAYLOAD: 32 * 1024,
+  MAX_TEXT: 2000,
+  NAME_RE: /^[A-Za-z0-9 _.-]{2,16}$/,
+  ROOM_RE: /^[A-Za-z0-9 _-]{2,24}$/,
+  EMOJI: ['👍', '❤️', '😂', '🎉', '👀', '🔥'],
+  DEFAULT_ROOMS: ['lab-room'],
+  SAVE_DEBOUNCE_MS: 1000,
+  EDIT_WINDOW_MS: 300000,
+  MIN_BURN_S: 5,
+  MAX_BURN_S: 300,
+  TYPING_TTL_MS: 4000,
+  UNNAMED_GRACE_MS: 30000,
+  BUCKET_SIZE: 5,
+  BUCKET_REFILL_MS: 1000,
+  AUTH_WINDOW_MS: 60000,
+  SESSION_TTL_MS: 7 * 24 * 60 * 60 * 1000,
+  MIN_PASSWORD: 8,
+  MAX_PASSWORD: 200,
+  PUBLIC_DIR: path.join(__dirname, '..', 'public'),
+  WS_PATH: '/ws',
+};
