@@ -50,7 +50,26 @@ function banner() {
   log.raw('');
 }
 
+// Requirement 1 is "messages are stored in a database". A server that starts
+// with no store configured and silently discards every message is the exact
+// failure the lab is about, so an unset DATABASE_URL is a startup error rather
+// than a default. `none` remains available for the cases that genuinely want
+// no persistence — it just has to be said out loud.
+function requireStorageDecision() {
+  if (config.DATABASE_URL_SET) return;
+  log.error('DATABASE_URL is not set, so there is nowhere to store messages.');
+  log.error('');
+  log.error('  Durable  DATABASE_URL=postgresql://…   (Neon: copy the POOLED string)');
+  log.error('  Ephemeral  DATABASE_URL=memory         works fully, lost on restart');
+  log.error('  Deliberately off  DATABASE_URL=none    nothing is stored at all');
+  log.error('');
+  log.error('See .env.example. Refusing to start rather than drop every message silently.');
+  process.exit(1);
+}
+
 async function start() {
+  requireStorageDecision();
+
   if (config.PERSISTENCE_ENABLED) {
     // All-or-nothing. A configured database that cannot be reached must never
     // degrade silently into an unauthenticated server.

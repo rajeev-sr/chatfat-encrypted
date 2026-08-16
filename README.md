@@ -21,20 +21,47 @@ first suspect: `sudo ufw allow 3000/tcp`.
 
 | `DATABASE_URL` | Accounts | Messages |
 | --- | --- | --- |
-| *(unset)* | off — a username is a claim, not an identity | nothing stored, nothing replayed |
+| *(unset)* | — | **the server refuses to start** |
+| `none` | off — a username is a claim, not an identity | nothing stored, nothing replayed |
 | `memory` | on, in-process | stored in the heap, lost on restart |
 | `postgres://…` | on, durable | stored in Postgres |
+
+An **unset** `DATABASE_URL` used to mean "silently store nothing". It now exits with an
+error naming the three real options, because a chat server that looks like it is working
+while every message disappears is the one failure mode worth being loud about. Saying
+`none` keeps that behaviour available — as a decision rather than an oversight.
 
 ```bash
 PORT=9000 npm start
 DATABASE_URL=memory npm start
-DATABASE_URL='postgres://user:pass@host/db' npm start
+DATABASE_URL='postgresql://…?sslmode=require' npm start
 npm run dev                            # node --watch
 ```
 
 **Recording and replaying are separate questions.** With a database configured, messages
-*are* written — but `HISTORY_REPLAY` governs how many a joining client is handed, and it is
-`0` by default. You see what is said while you are in a room, and nothing else.
+*are* written — but `HISTORY_REPLAY` governs how many a joining client is handed. It is
+`50` by default; set it to `0` and messages are still stored, you are simply handed none
+of them on the way in.
+
+### Neon
+
+The deployed configuration points at [Neon](https://neon.tech). Copy the **pooled**
+connection string — the host contains `-pooler` — and keep `?sslmode=require`; Neon
+refuses plaintext connections.
+
+Two things worth knowing before a demo:
+
+- **The free tier scales to zero** after a few minutes idle, so the first query after a
+  quiet spell pays roughly half a second of cold start. Harmless in use, alarming on a
+  recording. Hit `/healthz` once before you start.
+- **`pg` prints an SSL deprecation warning** for `sslmode=require` on startup. It is
+  noise, not a misconfiguration; `verify-full` is what the driver already does.
+
+The schema is applied by numbered migrations in `src/db/migrations/`, tracked in a
+`schema_version` table, each inside a transaction and behind an advisory lock so two
+servers booting at once cannot both apply the same one. Editing a migration that has
+already been applied is refused — its checksum is recorded, and a changed one means this
+database and a fresh one have silently diverged.
 
 ---
 
@@ -111,9 +138,9 @@ the old one can still read older ones — rotation does not re-encrypt history.
 | `PORT` | `3000` | Listen port |
 | `HOST` | `0.0.0.0` | Bind interface. `127.0.0.1` keeps it local |
 | `ALLOWED_ORIGINS` | *(empty)* | Comma-separated origins allowed to open a socket. Empty ⇒ the browser's `Origin` host must equal the `Host` it dialled |
-| `DATABASE_URL` | *(empty)* | The one switch — see above |
+| `DATABASE_URL` | *(unset ⇒ refuses to start)* | The one switch — see above |
 | `DATA_DIR` | `./data` | Where `rooms.json` is written, when there is no database |
-| `HISTORY_REPLAY` | `0` | How many stored messages a joining client receives. `0` replays nothing |
+| `HISTORY_REPLAY` | `50` | How many stored messages a joining client receives. `0` replays nothing |
 | `HISTORY_CAP` | `200` | Per-room in-memory buffer. Bounds how far back an edit/react/reply can reach; **not** a browsable window |
 | `MAX_ROOMS` | `24` | Ceiling on rooms |
 | `HEARTBEAT_MS` | `15000` | Heartbeat sweep interval |

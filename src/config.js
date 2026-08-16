@@ -19,7 +19,22 @@ const bool = (k, dflt) => {
   return !(v === '0' || v.toLowerCase() === 'false' || v.toLowerCase() === 'off');
 };
 
-const DATABASE_URL = str('DATABASE_URL', '');
+// DATABASE_URL has four states, and the difference between two of them is the
+// whole point of Lab 4 requirement 1:
+//
+//   postgres://…  durable storage. The deployed configuration.
+//   memory        everything works, held in this process, lost on restart.
+//   none          deliberately no persistence. The protocol suite uses this.
+//   (unset)       you have not configured it yet — the server refuses to start.
+//
+// `unset` used to mean "silently store nothing", which is exactly the failure
+// the lab forbids: a server that looks like it is working while every message
+// disappears. Making the omission loud costs one env var and removes a class
+// of demo-day surprise. `none` exists so that "no persistence" stays
+// expressible — as a decision, rather than as an oversight.
+const RAW_DATABASE_URL = str('DATABASE_URL', '');
+const DATABASE_URL = RAW_DATABASE_URL === 'none' ? '' : RAW_DATABASE_URL;
+const DATABASE_URL_SET = RAW_DATABASE_URL !== '';
 const PERSISTENCE_ENABLED = !!DATABASE_URL;
 const USE_POSTGRES = PERSISTENCE_ENABLED && DATABASE_URL !== 'memory';
 
@@ -32,9 +47,14 @@ module.exports = {
     .map((s) => s.trim())
     .filter(Boolean),
   DATABASE_URL,
+  DATABASE_URL_SET,
   DATA_DIR: path.resolve(str('DATA_DIR', path.join(process.cwd(), 'data'))),
   // The minimum here is 0, not 1 — otherwise the off switch fails quietly.
-  HISTORY_REPLAY: int('HISTORY_REPLAY', 0, 0, 200),
+  // Recording and replaying stay separate questions: a server can store every
+  // message and still hand a joining client nothing. 50 is the default because
+  // requirement 2 is "a user receives previous chat history", and a default of
+  // 0 meant the shipped configuration did not satisfy it.
+  HISTORY_REPLAY: int('HISTORY_REPLAY', 50, 0, 200),
   HISTORY_CAP: int('HISTORY_CAP', 200, 10, 5000),
   MAX_ROOMS: int('MAX_ROOMS', 24, 1, 500),
   HEARTBEAT_MS: int('HEARTBEAT_MS', 15000, 1000),

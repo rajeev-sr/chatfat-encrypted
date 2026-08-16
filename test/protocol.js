@@ -13,7 +13,11 @@ const { ok, eq, bail, report, startServer, client, sleep } = require('./harness'
 const PORT = 8099;
 
 async function main() {
-  const server = await startServer(PORT, { HEARTBEAT_MS: '700', MAX_ROOMS: '24' });
+  // HISTORY_REPLAY is pinned rather than inherited. This suite exercises the
+  // no-storage, no-replay configuration deliberately, and since P1 the default
+  // is 50 — a suite whose meaning changes when a default changes was never
+  // asserting what it claimed to.
+  const server = await startServer(PORT, { HEARTBEAT_MS: '700', MAX_ROOMS: '24', HISTORY_REPLAY: '0' });
 
   // ── hello, and the unnamed gate ──────────────────────────────────────────
   const a = await client(PORT);

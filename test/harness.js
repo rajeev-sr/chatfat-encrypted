@@ -59,7 +59,19 @@ async function startServer(port, env = {}) {
   // wrong reason.
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatfat-test-'));
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
-    env: { ...process.env, ChatFat_ENV_FILE: 'off', PORT: String(port), HOST: '127.0.0.1', DATA_DIR: dataDir, ...env },
+    // DATABASE_URL defaults to the explicit off switch, not to unset: since P1
+    // an unset DATABASE_URL is a startup error, and a suite that wants no
+    // persistence has to say so like everybody else. A suite that wants
+    // storage overrides it through `env`.
+    env: {
+      ...process.env,
+      ChatFat_ENV_FILE: 'off',
+      PORT: String(port),
+      HOST: '127.0.0.1',
+      DATA_DIR: dataDir,
+      DATABASE_URL: 'none',
+      ...env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

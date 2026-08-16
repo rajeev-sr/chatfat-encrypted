@@ -142,6 +142,37 @@ async function main() {
   await sleep(150);
   off.stop();
 
+  // ── an unset DATABASE_URL is a startup error, not a silent no-op ─────────
+  // Requirement 1 is "messages are stored in a database". A server that boots
+  // with nowhere to store them and drops every one is the precise failure the
+  // lab is about, so the omission has to be loud.
+  const { spawn } = require('node:child_process');
+  const path = require('node:path');
+  const unset = await new Promise((resolve) => {
+    const env = { ...process.env, ChatFat_ENV_FILE: 'off', PORT: '8093', HOST: '127.0.0.1' };
+    delete env.DATABASE_URL;
+    const child = spawn(process.execPath, [path.join(__dirname, '..', 'server.js')], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (b) => { out += b.toString(); });
+    child.stderr.on('data', (b) => { out += b.toString(); });
+    child.on('exit', (code) => resolve({ code, out }));
+    setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 8000);
+  });
+  eq(unset.code, 1, 'an unset DATABASE_URL exits non-zero instead of starting');
+  ok(unset.out.includes('nowhere to store messages'), 'and says why in plain words');
+  ok(unset.out.includes('DATABASE_URL=none'), 'and names the explicit off switch');
+
+  // ── the shipped default replays history ─────────────────────────────────
+  // Requirement 2 is satisfied by the default configuration or it is not
+  // satisfied at all — a grader who runs `npm start` must see history.
+  const dflt = await startServer(8092, { DATABASE_URL: 'memory', AUTH_MAX_ATTEMPTS: '500' });
+  const dfltHealth = await (await fetch('http://127.0.0.1:8092/healthz')).json();
+  eq(dfltHealth.historyReplay, 50, 'HISTORY_REPLAY defaults to 50, so the shipped server replays');
+  dflt.stop();
+
   report('persistence');
 }
 
