@@ -119,6 +119,18 @@ module.exports = {
   BETTER_AUTH_SECRET: str('BETTER_AUTH_SECRET', ''),
   BETTER_AUTH_URL: str('BETTER_AUTH_URL', `http://localhost:${int('PORT', 3000, 1, 65535)}`),
   MAX_CIPHERTEXT: int('MAX_CIPHERTEXT', 12288, 1024, 1024 * 1024),
+
+  // — load-balancing lab (src/transport/bench.js) —
+  // BENCH_ENABLED gates the whole endpoint, so a normal deployment of the chat
+  // app exposes nothing extra. BACKEND_NAME is what /bench reports and what the
+  // X-Backend header carries, which is how the report proves that requests
+  // reached three different machines rather than one.
+  BENCH_ENABLED: bool('BENCH_ENABLED', false),
+  BACKEND_NAME: str('BACKEND_NAME', require('node:os').hostname()),
+  // Default per-request CPU cost, in rounds of SHA-256. Overridable per request
+  // with ?work=N; 0 makes /bench a trivial JSON reply.
+  BENCH_WORK: int('BENCH_WORK', 0, 0, 200000),
+  BENCH_FAILURE_RATE: Number(str('BENCH_FAILURE_RATE', '0')) || 0,
   // At-rest encryption of stored message text (requirement 3) and its keys
   // (requirement 4 rides on the same AEAD tag — see src/crypto/atRest.js).
   MASTER_KEYS,

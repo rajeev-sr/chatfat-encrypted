@@ -9,3 +9,7 @@ data/
 # must be un-ignored or relocated before submission — see P11.
 # docs/
 # progress.md
+
+# Load-balancing lab: compiled binaries and measured output.
+bin/
+results/

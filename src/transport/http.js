@@ -11,6 +11,7 @@ const log = require('../logger');
 const { hub } = require('../state/hub');
 const auth = require('../auth');
 const { repository } = require('../messages/repository');
+const bench = require('./bench');
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -122,6 +123,9 @@ function createServer() {
     const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
 
     if (pathname === '/healthz') return json(res, 200, healthz());
+    // Load-balancing lab. Checked early and unconditionally cheap when
+    // BENCH_ENABLED is off, so it costs the chat path nothing.
+    if (bench.handle(req, res, pathname)) return;
     if (pathname.startsWith('/api/auth')) return handleBetterAuth(req, res, ip);
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return json(res, 405, { code: 'BAD_REQUEST', message: 'GET only.' });

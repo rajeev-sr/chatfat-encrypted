@@ -13,6 +13,12 @@ npm start                              # port 3000, no accounts, nothing stored
 Open the printed **lan** link on each machine. If one cannot connect, the firewall is the
 first suspect: `sudo ufw allow 3000/tcp`.
 
+> **Load-balancing lab.** A round-robin reverse-proxy load balancer in Go, run in front of
+> three copies of this server across four machines — see **[LOADBALANCER.md](LOADBALANCER.md)**
+> for the topology, the commands per system, and how the report is generated. Code lives in
+> [`lb/`](lb/); the backend side is one endpoint, [`src/transport/bench.js`](src/transport/bench.js),
+> off unless `BENCH_ENABLED=1`.
+
 ---
 
 ## One switch
