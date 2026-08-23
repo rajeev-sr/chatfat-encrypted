@@ -14,6 +14,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -146,6 +147,17 @@ type LoadBalancer struct {
 	startedNanos atomic.Int64
 }
 
+// backendTLS is the TLS configuration used for every outbound connection to a
+// backend — the proxy's and the health probe's alike. They must agree: a health
+// loop that trusts the certificate while the proxy does not (or the reverse)
+// reports a backend as healthy and then fails every request to it.
+func backendTLS() *tls.Config {
+	if !insecureBackends {
+		return nil // system trust store
+	}
+	return &tls.Config{InsecureSkipVerify: true} // #nosec G402 — see insecureBackends
+}
+
 func (lb *LoadBalancer) markStart() { lb.startedNanos.Store(time.Now().UnixNano()) }
 
 // uptime is the length of the current measurement window: since process start,
@@ -172,8 +184,16 @@ func (lb *LoadBalancer) nextBackend() *Backend {
 
 func (lb *LoadBalancer) healthLoop(ctx context.Context, path string, interval, timeout time.Duration) {
 	// Its own client, and deliberately not the proxy transport: probes must not
-	// queue behind the request traffic they are trying to measure.
-	client := &http.Client{Timeout: timeout}
+	// queue behind the request traffic they are trying to measure. Its TLS
+	// settings still have to match the proxy's — see backendTLS.
+	client := &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			TLSClientConfig:     backendTLS(),
+			TLSHandshakeTimeout: 5 * time.Second,
+			DisableKeepAlives:   false,
+		},
+	}
 
 	// record applies hysteresis. A single missed probe does not evict, because
 	// the backends here are single-threaded Node processes: at saturation the
@@ -392,6 +412,17 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func round2(f float64) float64 { return float64(int64(f*100+0.5)) / 100 }
 
+// insecureBackends turns off certificate verification for backend connections.
+//
+// It exists because the backends here present a self-signed certificate, which
+// nothing trusts by default. Worth being clear about what this costs: skipping
+// verification keeps the encryption and gives up the authentication, so the
+// connection is protected against passive eavesdropping but not against a
+// man-in-the-middle that can answer at the backend's address. On a lab bridge
+// that is an acceptable trade; on a real network it is not, and the fix there
+// is a certificate the load balancer actually trusts, not this flag.
+var insecureBackends bool
+
 // unhealthyThreshold / healthyThreshold are the health-check hysteresis; see
 // the comment on record() in healthLoop.
 var (
@@ -456,6 +487,8 @@ func parseBackends(raw string, timeout time.Duration, lb *LoadBalancer) ([]*Back
 			MaxIdleConnsPerHost: 256,
 			IdleConnTimeout:     90 * time.Second,
 			ForceAttemptHTTP2:   false,
+			TLSClientConfig:     backendTLS(),
+			TLSHandshakeTimeout: 5 * time.Second,
 		}
 		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 			b.Errors.Add(1)
@@ -508,6 +541,10 @@ func main() {
 	healthInterval := flag.Duration("health-interval", time.Second, "how often to probe backends")
 	healthTimeout := flag.Duration("health-timeout", 800*time.Millisecond, "per-probe timeout")
 	backendTimeout := flag.Duration("backend-timeout", 5*time.Second, "backend response-header timeout")
+	tlsCert := flag.String("tls-cert", "", "PEM certificate; with -tls-key, the load balancer itself serves HTTPS")
+	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
+	flag.BoolVar(&insecureBackends, "insecure-backends", false,
+		"skip certificate verification when connecting to https:// backends (needed for self-signed certs)")
 	flag.IntVar(&unhealthyThreshold, "unhealthy-threshold", 3, "consecutive failed probes before a backend is evicted")
 	flag.IntVar(&healthyThreshold, "healthy-threshold", 1, "consecutive good probes before an evicted backend returns")
 	flag.BoolVar(&strictEviction, "strict-eviction", false,
@@ -523,6 +560,19 @@ func main() {
 		}
 		flag.Usage()
 		os.Exit(2)
+	}
+
+	if (*tlsCert == "") != (*tlsKey == "") {
+		fmt.Fprintln(os.Stderr, "lb: -tls-cert and -tls-key must be given together")
+		os.Exit(2)
+	}
+	// The single most likely way to get this wrong is to point https:// backends
+	// at a self-signed certificate and leave verification on, which fails every
+	// probe with an unhelpful x509 error. Say so up front rather than let it
+	// look like the backends are down.
+	if strings.Contains(*backends, "https://") && !insecureBackends {
+		log.Printf("lb: note — https:// backends with certificate verification ON; " +
+			"add -insecure-backends if they use a self-signed certificate")
 	}
 
 	lb := &LoadBalancer{}
@@ -566,7 +616,11 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("lb: listening on %s", *listen)
+	scheme := "http"
+	if *tlsCert != "" {
+		scheme = "https"
+	}
+	log.Printf("lb: listening on %s (%s)", *listen, scheme)
 	for _, b := range lb.backends {
 		log.Printf("lb: backend %s (health %s%s)", b.URL, strings.TrimRight(b.URL.String(), "/"), *healthPath)
 	}
@@ -579,7 +633,18 @@ func main() {
 		_ = srv.Shutdown(sctx)
 	}()
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("lb: %v", err)
+	var serveErr error
+	if *tlsCert != "" {
+		// Go negotiates HTTP/2 over TLS by default. Left on, the load balancer
+		// would speak h2 to the load generator and HTTP/1.1 to the backends,
+		// so the two experiments would not be comparable with the plain-HTTP
+		// runs. Pinning h1 keeps every configuration measuring the same thing.
+		srv.TLSNextProto = map[string]func(*http.Server, *tls.Conn, http.Handler){}
+		serveErr = srv.ListenAndServeTLS(*tlsCert, *tlsKey)
+	} else {
+		serveErr = srv.ListenAndServe()
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		log.Fatalf("lb: %v", serveErr)
 	}
 }

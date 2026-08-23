@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -85,6 +86,7 @@ func main() {
 	out := flag.String("out", "results", "directory for the per-experiment JSON file")
 	csvPath := flag.String("csv", "results/comparison.csv", "cumulative CSV appended to after each run")
 	warmup := flag.Int("warmup", 200, "unmeasured requests sent first, to fill connection pools and JIT")
+	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (needed for a self-signed https:// target)")
 	lbBase := flag.String("lb", "", "load balancer base URL, e.g. http://10.1.75.53:3273. When given, its\n\tcounters are reset after the warmup and its /lb/metrics and /lb/status are\n\tsaved alongside this run's result.")
 	flag.Parse()
 
@@ -101,6 +103,14 @@ func main() {
 	// One shared client, so the pool is reused across all workers. A per-request
 	// client would open a fresh TCP connection every time and the experiment
 	// would measure the local dial cost, not the backends.
+	// One TLS config, shared by the load client and the /lb/* helpers below, so
+	// an https:// target does not work for the measurement and then fail on the
+	// metrics scrape.
+	var tlsConf *tls.Config
+	if *insecure {
+		tlsConf = &tls.Config{InsecureSkipVerify: true} // #nosec G402 — self-signed lab certificate
+	}
+
 	client := &http.Client{
 		Timeout: *timeout,
 		Transport: &http.Transport{
@@ -110,8 +120,20 @@ func main() {
 			MaxConnsPerHost:     0,
 			IdleConnTimeout:     60 * time.Second,
 			DisableCompression:  true,
+			// HTTP/1.1 on purpose, TLS or not: h2 multiplexes many requests
+			// over one connection, so "concurrency" would stop meaning
+			// "concurrent connections" and the TLS and plain-HTTP runs would
+			// not be comparable.
 			ForceAttemptHTTP2:   false,
+			TLSClientConfig:     tlsConf,
+			TLSHandshakeTimeout: 5 * time.Second,
 		},
+	}
+	// Short-lived client for the control-plane calls: /lb/reset and the two
+	// scrapes must not borrow connections from the measured pool.
+	admin := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: tlsConf, TLSHandshakeTimeout: 5 * time.Second},
 	}
 
 	fire := func(ctx context.Context) sample {
@@ -162,7 +184,7 @@ func main() {
 	// throughput otherwise reads materially below the client-side figure.
 	base := strings.TrimRight(*lbBase, "/")
 	if base != "" {
-		if err := postTo(base + "/lb/reset"); err != nil {
+		if err := postTo(admin, base+"/lb/reset"); err != nil {
 			fmt.Fprintf(os.Stderr, "loadgen: could not reset load-balancer counters (%v) — its numbers will include the warmup\n", err)
 		} else {
 			fmt.Printf("reset load-balancer counters at %s\n", base)
@@ -251,7 +273,7 @@ func main() {
 	// experiment produces every file the report needs for that run.
 	if base != "" {
 		for path, suffix := range map[string]string{"/lb/metrics": ".lb-metrics.json", "/lb/status": ".lb-status.json"} {
-			if err := saveGET(base+path, filepath.Join(*out, *experiment+suffix)); err != nil {
+			if err := saveGET(admin, base+path, filepath.Join(*out, *experiment+suffix)); err != nil {
 				fmt.Fprintf(os.Stderr, "loadgen: saving %s: %v\n", path, err)
 			}
 		}
@@ -261,12 +283,12 @@ func main() {
 	}
 }
 
-func postTo(u string) error {
+func postTo(c *http.Client, u string) error {
 	req, err := http.NewRequest(http.MethodPost, u, nil)
 	if err != nil {
 		return err
 	}
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return err
 	}
@@ -279,8 +301,8 @@ func postTo(u string) error {
 }
 
 // saveGET fetches u and writes the body to path.
-func saveGET(u, path string) error {
-	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(u)
+func saveGET(c *http.Client, u, path string) error {
+	resp, err := c.Get(u)
 	if err != nil {
 		return err
 	}
