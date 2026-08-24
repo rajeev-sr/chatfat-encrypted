@@ -60,11 +60,12 @@ func (b *Backend) Name() string { return b.URL.Host }
 
 // Metrics are the load balancer's own counters, reported by /lb/metrics.
 type Metrics struct {
-	Total         atomic.Uint64
-	Success       atomic.Uint64
-	Failed        atomic.Uint64
-	BackendErrors atomic.Uint64
-	NoBackend     atomic.Uint64 // rejected because every backend was down
+	Total          atomic.Uint64
+	Success        atomic.Uint64
+	Failed         atomic.Uint64
+	BackendErrors  atomic.Uint64
+	NoBackend      atomic.Uint64 // rejected because every backend was down
+	ClientCanceled atomic.Uint64 // client gave up before the backend answered
 
 	latencyMu      sync.Mutex
 	latencies      []time.Duration
@@ -113,6 +114,7 @@ func (m *Metrics) reset() {
 	m.Failed.Store(0)
 	m.BackendErrors.Store(0)
 	m.NoBackend.Store(0)
+	m.ClientCanceled.Store(0)
 	m.latencyMu.Lock()
 	m.latencies = m.latencies[:0]
 	m.latencyDropped = 0
@@ -389,6 +391,7 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"failed":           failed,
 		"backend_errors":   lb.metrics.BackendErrors.Load(),
 		"no_backend":       lb.metrics.NoBackend.Load(),
+		"client_canceled":  lb.metrics.ClientCanceled.Load(),
 		"dropout_percent":  round2(dropout),
 		"uptime_s":         round2(elapsed),
 		"throughput_rps":   round2(rps),
@@ -491,6 +494,28 @@ func parseBackends(raw string, timeout time.Duration, lb *LoadBalancer) ([]*Back
 			TLSHandshakeTimeout: 5 * time.Second,
 		}
 		p.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+			// The client hung up: its deadline expired, it was interrupted, or
+			// the connection dropped. The backend is not at fault and must not
+			// be evicted for it. Getting this wrong is self-reinforcing under
+			// load — a client-side deadline abandons requests exactly when the
+			// backend is slowest, so every abandoned request would evict the
+			// one backend still doing the work, and the load balancer would
+			// refuse traffic it could have served.
+			//
+			// Counted as failed, because the request was not served, but kept
+			// separate from BackendErrors so the report can tell "the client
+			// gave up" apart from "the backend broke". Not logged either: under
+			// a short client deadline these arrive in the thousands, and a log
+			// that scrolls is a log nobody reads.
+			if req.Context().Err() != nil || errors.Is(err, context.Canceled) {
+				lb.metrics.ClientCanceled.Add(1)
+				lb.metrics.Failed.Add(1)
+				if rec, ok := rw.(*statusRecorder); ok {
+					rec.failed = true
+				}
+				return // the connection is gone; there is nobody to write to
+			}
+
 			b.Errors.Add(1)
 			lb.metrics.BackendErrors.Add(1)
 			lb.metrics.Failed.Add(1)
@@ -512,6 +537,11 @@ func parseBackends(raw string, timeout time.Duration, lb *LoadBalancer) ([]*Back
 			// -strict-eviction restores the evict-on-any-error behaviour.
 			timeout := isTimeout(err)
 			if strictEviction || !timeout {
+				// okStreak too: it is the "consecutive good probes" counter the
+				// health loop restores on, and leaving it running across an
+				// eviction produced the nonsensical "UP after 32 good probes"
+				// immediately after a backend was marked down.
+				b.okStreak.Store(0)
 				b.Alive.Store(false)
 			}
 			status := http.StatusBadGateway
