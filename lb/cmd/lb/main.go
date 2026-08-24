@@ -13,6 +13,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -66,6 +67,7 @@ type Metrics struct {
 	BackendErrors  atomic.Uint64
 	NoBackend      atomic.Uint64 // rejected because every backend was down
 	ClientCanceled atomic.Uint64 // client gave up before the backend answered
+	TLSHandshakes  atomic.Uint64 // inbound connections that died before the TLS handshake finished
 
 	latencyMu      sync.Mutex
 	latencies      []time.Duration
@@ -115,6 +117,7 @@ func (m *Metrics) reset() {
 	m.BackendErrors.Store(0)
 	m.NoBackend.Store(0)
 	m.ClientCanceled.Store(0)
+	m.TLSHandshakes.Store(0)
 	m.latencyMu.Lock()
 	m.latencies = m.latencies[:0]
 	m.latencyDropped = 0
@@ -386,22 +389,44 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"total":            total,
-		"success":          lb.metrics.Success.Load(),
-		"failed":           failed,
-		"backend_errors":   lb.metrics.BackendErrors.Load(),
-		"no_backend":       lb.metrics.NoBackend.Load(),
-		"client_canceled":  lb.metrics.ClientCanceled.Load(),
-		"dropout_percent":  round2(dropout),
-		"uptime_s":         round2(elapsed),
-		"throughput_rps":   round2(rps),
-		"p50_ms":           round2(percentile(lat, 50)),
-		"p95_ms":           round2(percentile(lat, 95)),
-		"p99_ms":           round2(percentile(lat, 99)),
-		"samples":          len(lat),
-		"samples_dropped":  lb.metrics.droppedLatencies(),
-		"per_backend_reqs": per,
+		"total":                  total,
+		"success":                lb.metrics.Success.Load(),
+		"failed":                 failed,
+		"backend_errors":         lb.metrics.BackendErrors.Load(),
+		"no_backend":             lb.metrics.NoBackend.Load(),
+		"client_canceled":        lb.metrics.ClientCanceled.Load(),
+		"tls_handshake_failures": lb.metrics.TLSHandshakes.Load(),
+		"dropout_percent":        round2(dropout),
+		"uptime_s":               round2(elapsed),
+		"throughput_rps":         round2(rps),
+		"p50_ms":                 round2(percentile(lat, 50)),
+		"p95_ms":                 round2(percentile(lat, 95)),
+		"p99_ms":                 round2(percentile(lat, 99)),
+		"samples":                len(lat),
+		"samples_dropped":        lb.metrics.droppedLatencies(),
+		"per_backend_reqs":       per,
 	})
+}
+
+// serverErrorLog filters net/http's connection-level error log.
+//
+// "TLS handshake error ... EOF" means a client opened a TCP connection and went
+// away before completing the handshake. That is a client-side event, and under
+// load it arrives once per abandoned connection — hundreds of lines that bury
+// every message that matters, which is exactly when the operator most needs to
+// read the log. Counted instead, and surfaced in /lb/metrics as
+// tls_handshake_failures; everything else passes through unchanged.
+type serverErrorLog struct {
+	out   io.Writer
+	count *atomic.Uint64
+}
+
+func (s serverErrorLog) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("TLS handshake error")) {
+		s.count.Add(1)
+		return len(p), nil
+	}
+	return s.out.Write(p)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -644,6 +669,7 @@ func main() {
 		// sever every chat session on a fixed schedule.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
+		ErrorLog:          log.New(serverErrorLog{out: os.Stderr, count: &lb.metrics.TLSHandshakes}, "", log.LstdFlags),
 	}
 
 	scheme := "http"
