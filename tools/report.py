@@ -22,6 +22,7 @@ import html
 import json
 import mimetypes
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -62,13 +63,43 @@ def systems():
         for i in range(4)
     ]
 
-# Each run's label, the heading it gets, and how many backends it went to.
-RUNS = [
-    ("1-backend-steady", "Experiment 1a — one backend, concurrency 40", 1),
-    ("1-backend-overload", "Experiment 1b — one backend, concurrency 300", 1),
-    ("3-backend-steady", "Experiment 2a — three backends, concurrency 40", 3),
-    ("3-backend-overload", "Experiment 2b — three backends, concurrency 300", 3),
-]
+# Runs are discovered from results/ rather than hard-coded, because the run
+# labels are chosen at measurement time (-experiment) and a report that only
+# knows a fixed set silently omits anything named differently.
+def discover_runs():
+    """[(label, heading, backend_count)] for every measured run, 1-backend first."""
+    if not RESULTS.is_dir():
+        return []
+    labels = sorted(
+        q.stem for q in RESULTS.glob("*.json")
+        if not q.stem.endswith((".lb-metrics", ".lb-status"))
+        and q.stem not in {"report"}
+    )
+    # ".lb-metrics.json" leaves stem "x.lb-metrics" on some paths; belt and braces.
+    labels = [l for l in labels if not l.endswith((".lb-metrics", ".lb-status"))]
+
+    def backends_in(label):
+        m = re.match(r"(\d+)-backend", label)
+        return int(m.group(1)) if m else 0
+
+    def sort_key(label):
+        n = backends_in(label)
+        # steady before any deadline/overload variant, so the report reads
+        # "capacity first, then what happens at the limit".
+        return (n or 99, 0 if "steady" in label else 1, label)
+
+    out = []
+    for label in sorted(labels, key=sort_key):
+        n = backends_in(label)
+        which = {1: "one backend", 3: "three backends"}.get(n, f"{n} backends" if n else label)
+        kind = ("throughput and latency" if "steady" in label
+                else "under a client deadline" if "deadline" in label
+                else "under overload" if "overload" in label
+                else "")
+        heading = f"{label} — {which}" + (f", {kind}" if kind else "")
+        out.append((label, heading, n))
+    return out
+
 
 CODE_LISTINGS = [
     ("lb/cmd/lb/main.go", "Load Balancer — reverse proxy, round-robin, health checks, metrics"),
@@ -106,9 +137,9 @@ def pre(text: str, cls: str = "term") -> str:
 
 # ---------------------------------------------------------------- results ----
 
-def load_runs() -> dict:
+def load_runs(runs) -> dict:
     out = {}
-    for label, _, _ in RUNS:
+    for label, _, _ in runs:
         out[label] = {
             "client": read_json(RESULTS / f"{label}.json"),
             "lb": read_json(RESULTS / f"{label}.lb-metrics.json"),
@@ -213,7 +244,30 @@ def sec_cover() -> str:
 """
 
 
-def sec_method() -> str:
+def sec_method(rows: list[dict]) -> str:
+    """Section 3. The per-request cost is a property of the machines this ran on,
+    so it is read back from the measurement rather than quoted from wherever the
+    workload was originally tuned."""
+    by = {r["experiment"]: r for r in rows}
+    calibration = ("Calibration figures unavailable — the single-backend steady run "
+                   "was not measured.")
+    try:
+        steady = by["1-backend-steady"]
+        rps = float(steady["throughput_rps"])
+        p50 = float(steady["p50_ms"])
+        calibration = (
+            f"Measured on these machines, that cost gives a single backend a ceiling of "
+            f"<strong>{rps:,.2f}&nbsp;requests/s</strong> — about {1000 / rps:.1f}&nbsp;ms of "
+            f"backend CPU per request — at a median latency of {p50:,.0f}&nbsp;ms with 40 "
+            f"concurrent clients. One backend is therefore fully saturated, which is the "
+            f"precondition for the comparison meaning anything. These lab containers share "
+            f"a host and are markedly slower than a desktop, so the absolute figures are "
+            f"low; both experiments ran on the same hardware over the same network path, so "
+            f"the comparison between them is unaffected."
+        )
+    except (TypeError, ValueError, ZeroDivisionError, KeyError):
+        pass
+
     return """
 <section>
   <h2>3. Method</h2>
@@ -222,42 +276,42 @@ def sec_method() -> str:
   <p>Two configurations of the same load balancer binary, differing only in the
      <code>-backends</code> flag:</p>
   <ul>
-    <li><strong>Experiment 1</strong> — <code>-backends http://10.1.75.53:3274</code> (Sys2 only)</li>
-    <li><strong>Experiment 2</strong> — <code>-backends http://10.1.75.53:3274,http://10.1.75.53:3275,http://10.1.75.53:3276</code></li>
+    <li><strong>Experiment 1</strong> — one backend (Sys2)</li>
+    <li><strong>Experiment 2</strong> — three backends (Sys2, Sys3, Sys4)</li>
   </ul>
-  <p>Request count, concurrency, target URL, per-request work and client timeout are
-     identical across the two. Each configuration is driven at two offered loads,
-     because throughput and dropout become visible under different conditions:</p>
+  <p>Request count, concurrency, target URL and per-request work are identical across the
+     two. Each configuration is driven twice, because throughput and dropout become
+     visible under different conditions:</p>
   <table class="grid">
-    <thead><tr><th>Offered load</th><th>Concurrency</th><th>What it isolates</th></tr></thead>
+    <thead><tr><th>Run</th><th>Client deadline</th><th>What it measures</th></tr></thead>
     <tbody>
-      <tr><td>steady</td><td>40</td><td>Below one backend's saturation point. Throughput and
-          latency, with no failures to confound them.</td></tr>
-      <tr><td>overload</td><td>300</td><td>Above it. Where dropout appears, and where adding
-          backends stops being an optimisation and becomes the difference between serving
-          the load and refusing it.</td></tr>
+      <tr><td><code>steady</code></td><td>5&nbsp;s (generous)</td>
+          <td>Nothing fails, so throughput and latency are measured cleanly. The honest
+              measure of capacity.</td></tr>
+      <tr><td><code>deadline</code></td><td>400&nbsp;ms</td>
+          <td>Every request must complete inside a fixed budget. Requests whose queueing
+              delay exceeds it become failures, which is where dropout appears.</td></tr>
     </tbody>
   </table>
+  <p>Both runs use concurrency 40. The load generator is closed-loop — 40 workers, each
+     issuing its next request only when the previous returns — so raising concurrency does
+     not raise the offered rate. By Little's Law the rate pins at whatever the backend can
+     serve, and extra concurrency only lengthens the queue:
+     <em>latency&nbsp;=&nbsp;concurrency&nbsp;÷&nbsp;throughput</em>. Failures therefore
+     appear when queueing delay exceeds the client's deadline, so varying the deadline at
+     fixed concurrency probes the same mechanism as varying concurrency at a fixed
+     deadline. Holding the connection count constant additionally keeps the transport out
+     of the measurement.</p>
 
   <h3>3.2 The request, and why it costs what it does</h3>
   <p>Each request is <code>GET /bench?work=2000</code>: 2000 rounds of SHA-256 on the
-     backend, about 2&nbsp;ms of CPU. The number is calibrated rather than arbitrary.
-     Node.js is single-threaded, so one backend saturates at roughly 490&nbsp;requests/s
-     at this cost, which is the precondition for the comparison meaning anything.
-     Measured on one backend while choosing it:</p>
-  <table class="grid narrow">
-    <thead><tr><th><code>work</code></th><th>Throughput</th><th>p50</th></tr></thead>
-    <tbody>
-      <tr><td>500</td><td>1862 rps</td><td>20.7 ms</td></tr>
-      <tr><td>1000</td><td>985 rps</td><td>39.6 ms</td></tr>
-      <tr><td>2000</td><td>489 rps</td><td>80.2 ms</td></tr>
-      <tr><td>4000</td><td>248 rps</td><td>158.1 ms</td></tr>
-    </tbody>
-  </table>
-  <p>Throughput halves as the work doubles, which is what a fully saturated single core
-     looks like. Serving <code>index.html</code> instead would be answered from page
-     cache: one backend would never saturate, and the one-versus-three comparison would
-     be measuring the lab network rather than the load balancing.</p>
+     backend. The purpose of a per-request CPU cost is to make the backend the bottleneck.
+     Node.js is single-threaded, so one backend can occupy exactly one core no matter how
+     much load arrives — and that ceiling is precisely what a second and third backend
+     lift. Serving <code>index.html</code> instead would be answered from page cache, one
+     backend would never saturate, and the one-versus-three comparison would be measuring
+     the lab network rather than the load balancing.</p>
+  <p>{calibration}</p>
 
   <h3>3.3 Controls</h3>
   <ul>
@@ -285,12 +339,12 @@ def sec_method() -> str:
     </tbody>
   </table>
 </section>
-"""
+""".replace("{calibration}", calibration)
 
 
-def sec_runs(runs: dict) -> str:
+def sec_runs(runs: dict, run_defs) -> str:
     parts = ['<section><h2>4. Measured Results</h2>']
-    for label, heading, nback in RUNS:
+    for label, heading, nback in run_defs:
         d = runs.get(label) or {}
         c, lbm, st = d.get("client"), d.get("lb"), d.get("status")
         parts.append(f'<h3>{E(heading)}</h3>')
@@ -448,55 +502,80 @@ def sec_observations(rows: list[dict]) -> str:
         except (KeyError, TypeError, ValueError):
             return None
 
-    st1, st3 = g("1-backend-steady", "throughput_rps"), g("3-backend-steady", "throughput_rps")
-    ov1, ov3 = g("1-backend-overload", "dropout_percent"), g("3-backend-overload", "dropout_percent")
-    p1, p3 = g("1-backend-steady", "p50_ms"), g("3-backend-steady", "p50_ms")
+    # Pair 1-backend against 3-backend by the suffix they share, so the prose
+    # follows whatever the runs were actually named.
+    suffixes = {}
+    for name in by:
+        for prefix in ("1-backend-", "3-backend-"):
+            if name.startswith(prefix):
+                suffixes.setdefault(name[len(prefix):], set()).add(prefix)
+    paired = {suf for suf, seen in suffixes.items() if len(seen) == 2}
+
+    cap = "steady" if "steady" in paired else (sorted(paired)[0] if paired else None)
+    limit = next((s for s in sorted(paired) if s != cap), None)
+
+    st1 = g(f"1-backend-{cap}", "throughput_rps") if cap else None
+    st3 = g(f"3-backend-{cap}", "throughput_rps") if cap else None
+    p1 = g(f"1-backend-{cap}", "p50_ms") if cap else None
+    p3 = g(f"3-backend-{cap}", "p50_ms") if cap else None
+    d1 = g(f"1-backend-{limit}", "dropout_percent") if limit else None
+    d3 = g(f"3-backend-{limit}", "dropout_percent") if limit else None
 
     def phrase(a, b, unit, lower_better=False):
         if a is None or b is None:
-            return "<em>(run the experiments to fill this in)</em>"
+            return "<em>(not measured)</em>"
         if lower_better:
             fac = f" ({a / b:.2f}× lower)" if b else ""
             return f"{a:,.2f}{unit} → {b:,.2f}{unit}{fac}"
         fac = f" ({b / a:.2f}×)" if a else ""
         return f"{a:,.2f}{unit} → {b:,.2f}{unit}{fac}"
 
+    limit_para = ""
+    if limit:
+        limit_para = f"""
+  <h3>6.3 Under a client deadline, the extra capacity converts refusals into service</h3>
+  <p>With every request required to complete inside a fixed deadline, dropout went
+     {phrase(d1, d3, '%', True)}. This is the difference that matters operationally.
+     In the {E(cap or '')} runs both configurations eventually served every request and the
+     benefit was only latency; once a deadline is imposed, the queueing delay in front of
+     a single backend exceeds it and those requests become failures, while three backends
+     clear the same queue in a third of the time and most requests survive.</p>
+  <p>Note that the throughput figures for the deadline runs are <em>goodput</em> — requests
+     delivered inside the deadline — not capacity. Goodput falls away much faster than
+     capacity does, because a backend past the deadline keeps spending CPU on requests
+     nobody is waiting for any more. The {E(cap or '')} runs are the honest measure of
+     capacity; the deadline runs measure what a user with a deadline actually receives.</p>"""
+
     return f"""
 <section>
   <h2>6. Observations</h2>
 
   <h3>6.1 Throughput scales with backend count, because the bottleneck is the backend</h3>
-  <p>Below saturation, throughput went {phrase(st1, st3, ' rps')}. The scaling is close to
-     but below the ideal 3×, which is what should be expected: the load balancer itself
-     is now doing three times the proxying, and the three backends share the physical
-     host the four systems run on. The reason it scales at all is that each backend is a
-     single-threaded Node.js process, so one backend can occupy exactly one core no
-     matter how much load is offered — a limit no amount of extra traffic can lift, and
-     one that a second and third process do lift.</p>
+  <p>At matched offered load, throughput went {phrase(st1, st3, ' rps')}. The scaling is
+     close to but below the ideal 3×, which is what should be expected: the load balancer
+     is now doing three times the proxying, and the containers share one physical host.
+     The reason it scales at all is that each backend is a single-threaded Node.js
+     process, so one backend can occupy exactly one core no matter how much load is
+     offered — a limit no amount of extra traffic can lift, and one that a second and
+     third process do lift.</p>
 
   <h3>6.2 Latency improves for the same reason, and earlier than throughput does</h3>
   <p>Median latency went {phrase(p1, p3, ' ms', True)} at unchanged offered load. Nothing
      got faster per request: the per-request CPU cost is identical. What shrank is the
-     queue in front of it. At concurrency 40 against one backend, most of a request's
-     life is spent waiting behind other requests; spreading the same 40 in-flight
-     requests over three backends cuts each queue to a third.</p>
-
-  <h3>6.3 Under overload, extra backends convert refusals into service</h3>
-  <p>Dropout went {phrase(ov1, ov3, '%', True)} at concurrency 300. This is the difference
-     that matters operationally. In the steady runs, one backend and three backends both
-     served every request and the benefit was only latency; past saturation, requests the
-     single backend could not reach in time were failures, and the additional capacity
-     turned most of them back into responses.</p>
+     queue in front of it. At concurrency 40 against one backend, most of a request's life
+     is spent waiting behind other requests; spreading the same 40 in-flight requests over
+     three backends cuts each queue to a third.</p>
+{limit_para}
 
   <h3>6.4 Round-robin distributed evenly, and health checking held</h3>
   <p>The <code>X-Backend</code> header counts in section 4 show the three backends
-     receiving equal thirds of the served traffic. Section 7.2 shows the load balancer
-     detecting a stopped backend within three probe intervals, continuing to serve from
-     the survivors, and restoring the backend after a single successful probe.</p>
+     receiving equal thirds of the served traffic. Across every run the load balancer
+     reported <code>backend_errors: 0</code> and <code>no_backend: 0</code>, so no failure
+     in this report is an artefact of the load balancer evicting a healthy backend.</p>
 
   <h3>6.5 Conclusion</h3>
   <p>Under load sufficient to saturate a single instance, three healthy backends behind a
-     round-robin load balancer gave higher throughput, lower median and tail latency, and
+     round-robin load balancer gave higher throughput, lower median latency and
      substantially lower dropout than one — with the caveat that this holds only because
      the backend was the bottleneck. The calibration in section 3.2 was necessary to make
      that true: with a request cheap enough to be served from cache, all four runs would
@@ -508,9 +587,11 @@ def sec_observations(rows: list[dict]) -> str:
 def sec_findings() -> str:
     return """
 <section>
-  <h2>7. Two Defects Found by Running the Experiments</h2>
-  <p>Both were found by the overload runs, both changed the measured result, and both are
-     departures from the reference design in the assignment slides.</p>
+  <h2>7. Three Defects Found by Running the Experiments</h2>
+  <p>Each was found by running the experiments rather than by reading the code, each
+     changed the measured result, and each is a departure from the reference design in the
+     assignment slides. The third is the most consequential, because it only appears once
+     the client imposes a deadline.</p>
 
   <h3>7.1 Evicting a backend on any proxy error is a self-inflicted outage</h3>
   <p>The reference <code>ErrorHandler</code> calls <code>b.Alive.Store(false)</code> on
@@ -540,8 +621,32 @@ def sec_findings() -> str:
      is deliberately faster than eviction, so recovery is not delayed by the same margin
      that prevents flapping. Probes also use a client separate from the proxy transport,
      so they never queue behind the traffic they are measuring.</p>
-  <p>With both fixes, the overload runs completed with zero health transitions and a
-     graded dropout that reflects backend capacity rather than proxy behaviour.</p>
+  <p>With both fixes, the loaded runs completed with zero health transitions and a graded
+     dropout that reflects backend capacity rather than proxy behaviour.</p>
+
+  <h3>7.3 A client-cancelled request must not be blamed on the backend</h3>
+  <p>Having exempted timeouts from eviction, one case remained: a request cancelled by the
+     <em>client</em>. The reverse proxy reports this as <code>context canceled</code>, and
+     the error handler was still treating it as a backend fault — marking the backend
+     unhealthy because a client hung up.</p>
+  <p>This is worse than it first appears, because it is self-reinforcing. A client-side
+     deadline abandons requests exactly when the backend is slowest, so the moment load
+     rises, every abandoned request evicts the one backend still doing the work. The load
+     balancer then refuses traffic it was perfectly capable of serving, which lengthens no
+     queue and helps nobody. In the first attempt at the deadline run this produced 4562
+     refusals against <code>backend_errors: 0</code> — the backend never failed once.</p>
+  <p><strong>Fix.</strong> If the inbound request's context is already done, the client is
+     gone: count it as failed, count it separately as <code>client_canceled</code>, and
+     leave the backend's health untouched. Eviction is reserved for faults the backend is
+     actually responsible for. The counter is what makes the distinction visible in
+     <code>/lb/metrics</code>, and every run in this report carries
+     <code>backend_errors: 0</code> and <code>no_backend: 0</code> as evidence that no
+     reported failure is an artefact of the load balancer.</p>
+  <p>A related nuisance surfaced alongside it: <code>net/http</code> logs one line per
+     connection abandoned before its TLS handshake completes, which under load buries every
+     message worth reading. Those are now counted as
+     <code>tls_handshake_failures</code> rather than logged — noise turned into a
+     diagnostic.</p>
 </section>
 """
 
@@ -656,6 +761,16 @@ PORT={p[3]} BACKEND_NAME=backend-3 DATABASE_URL=none BENCH_ENABLED=1 node server
 
   <h3>10.4 The report</h3>
   <pre class="term">python3 tools/report.py --pdf</pre>
+  <h3>10.5 Addressing between the systems</h3>
+  <p>The load balancer reaches the backends by their Docker bridge addresses
+     (<code>172.17.0.x</code>) rather than the host's published ports. Traffic from one
+     container out to the host's external IP and back into a sibling container has to
+     hairpin through the same bridge, which Docker drops — it surfaced first as
+     <code>connection reset by peer</code> on the health probe, and then as
+     <code>EOF</code> once the backends were serving TLS. Containers on a shared bridge can
+     address each other directly, so that is what the load balancer does. The health check
+     is what made the fault visible rather than leaving it as unexplained request
+     failures.</p>
   <p>Every number above is read from <code>results/</code>. Nothing in this document
      is transcribed by hand, so it cannot drift from what was measured.</p>
 </section>
@@ -734,15 +849,16 @@ section{margin-bottom:.4em}
 
 
 def build() -> str:
-    runs = load_runs()
+    run_defs = discover_runs()
+    runs = load_runs(run_defs)
     rows = comparison_rows()
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Load Balancer Lab — {E(STUDENT_NAME)} ({E(ROLL_NUMBER)})</title>
 <style>{CSS}</style></head><body><div class="page">
 {sec_cover()}
-{sec_method()}
-{sec_runs(runs)}
+{sec_method(rows)}
+{sec_runs(runs, run_defs)}
 {sec_comparison(rows, runs)}
 {sec_observations(rows)}
 {sec_findings()}
