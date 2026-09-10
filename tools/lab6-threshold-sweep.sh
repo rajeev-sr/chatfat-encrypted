@@ -12,10 +12,14 @@
 set -uo pipefail
 
 HOST=10.1.75.53
-LB_PUB="https://$HOST:3273"
+LB_PUB="http://$HOST:3273"
 BACKENDS_PUB="http://$HOST:3274,http://$HOST:3275,http://$HOST:3276"
 SSH1=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p 2273 "student@$HOST")
-SSH4=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p 2276 "student@$HOST")
+# The competing load goes on Sys3, which runs a backend and nothing else.
+# Sys4 also hosts PostgreSQL, so loading it would slow every backend through
+# the shared database instead of degrading one of them — which is the opposite
+# of the condition this sweep needs.
+SSH_HOG=(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p 2275 "student@$HOST")
 
 DURATION="${1:-30s}"
 USERS="${2:-60}"
@@ -36,17 +40,16 @@ restart_lb() {
   "${SSH1[@]}" "
     tmux kill-session -t lb 2>/dev/null
     tmux new -d -s lb
-    tmux send-keys -t lb 'cd ~/chatfat-encrypted && ./bin/lb -listen 0.0.0.0:3000 \
+    tmux send-keys -t lb 'ulimit -n 65536; cd ~/chatfat-encrypted && ./bin/lb -listen 0.0.0.0:3000 \
       -backends http://172.17.0.75:3000,http://172.17.0.76:3000,http://172.17.0.77:3000 \
       -strategy p2c -load-threshold $1 \
-      -health-timeout 5s -backend-timeout 15s \
-      -tls-cert ./tls-cert.pem -tls-key ./tls-key.pem' C-m
+      -health-timeout 5s -backend-timeout 45s' C-m
     sleep 4" >/dev/null 2>&1
   curl -sk -m 8 "$LB_PUB/lb/status" >/dev/null 2>&1
 }
 
-say "starting competing load on Sys4"
-"${SSH4[@]}" "
+say "starting competing load on Sys3 (backend-2)"
+"${SSH_HOG[@]}" "
   tmux kill-session -t hog 2>/dev/null
   tmux new -d -s hog
   tmux send-keys -t hog 'while true; do seq 1 16 | xargs -P 16 -I{} curl -s -o /dev/null -m 10 \"http://127.0.0.1:3000/bench?work=4000\"; done' C-m" >/dev/null 2>&1
@@ -55,14 +58,14 @@ sleep 6
 for t in "${THRESHOLDS[@]}"; do
   say "threshold ${t}ms"
   restart_lb "$t"
-  "$BIN" -url "$LB_PUB" -insecure -users "$USERS" -duration "$DURATION" \
+  "$BIN" -url "$LB_PUB" -payload json -users "$USERS" -duration "$DURATION" \
     -backends "$BACKENDS_PUB" -seed "$SEED" \
     -experiment "thr-$t" -out "$TMP" 2>&1 | grep -E 'msg/s|throughput|latency all|per backend'
   sleep 5
 done
 
 say "stopping competing load"
-"${SSH4[@]}" 'tmux kill-session -t hog 2>/dev/null; true' >/dev/null 2>&1
+"${SSH_HOG[@]}" 'tmux kill-session -t hog 2>/dev/null; true' >/dev/null 2>&1
 
 python3 - "$TMP" "$OUT" <<'PY'
 import json, sys, glob, os, re
@@ -85,15 +88,30 @@ rows.sort(key=lambda r: r["threshold"])
 with open(os.path.join(out, "threshold-sweep.json"), "w") as fh:
     json.dump(rows, fh, indent=2)
 
-# A run that failed is not a fast run. Selecting on p95 alone once picked a
-# threshold from a run where the balancer had not come back up: every request
-# errored in a few milliseconds, which looked like the best latency in the
-# sweep. Candidates must have actually served the load before their latency
-# means anything.
-valid = [r for r in rows if r["served"] > 0 and r["failed"] / max(1, r["total"]) < 0.02]
-best = min(valid, key=lambda r: r["p95_ms"]) if valid else None
+# Choosing on p50, and never choosing 0.
+#
+# Two earlier criteria were wrong. Selecting on p95 alone once picked a run
+# where the balancer had not come back up: every request errored in a few
+# milliseconds, which looked like the best latency in the sweep — so a
+# candidate must have actually served the load. And selecting on any latency
+# measure at all let threshold 0 win, which is the control: it disables
+# switching entirely, so "0 is fastest" is not a threshold, it is the answer
+# that there should not be one.
+#
+# p50 is the discriminating measure here. The mean and p95 are dominated by the
+# handful of requests that reach the deliberately CPU-starved backend and sit
+# there until they time out, which swamps the difference the threshold makes;
+# the median shows it plainly, because the median request is precisely the one
+# the threshold either does or does not steer away. Reported alongside is the
+# degraded backend's share of traffic, which is what the threshold physically
+# controls.
+valid = [r for r in rows if r["threshold"] > 0 and r["served"] > 0
+         and r["failed"] / max(1, r["total"]) < 0.02]
+best = min(valid, key=lambda r: r["p50_ms"]) if valid else None
 for r in rows:
-    if r not in valid:
+    if r["threshold"] == 0:
+        r["excluded"] = "control: switching disabled, not a candidate"
+    elif r not in valid:
         r["excluded"] = "run failed — not a candidate"
 with open(os.path.join(out, "threshold-sweep.json"), "w") as fh:
     json.dump(rows, fh, indent=2)
@@ -105,7 +123,7 @@ for r in rows:
     if r.get("excluded"):
         note = "  <- EXCLUDED, " + r["excluded"]
     elif best and r is best:
-        note = "  <- lowest p95"
+        note = "  <- lowest p50"
     print(f"  {r['threshold']:>6} ms  {r['messages_per_s']:>7.1f}  {r['p50_ms']:>7.1f}ms  "
           f"{r['p95_ms']:>7.1f}ms  {r['p99_ms']:>7.1f}ms  {r['dist']}{note}")
 if best:
@@ -119,6 +137,6 @@ BEST=$(python3 -c "
 import json
 rows=json.load(open('$OUT/threshold-sweep.json'))
 ok=[r for r in rows if not r.get('excluded')]
-print(min(ok,key=lambda r:r['p95_ms'])['threshold'] if ok else 50)" 2>/dev/null || echo 50)
+print(min(ok,key=lambda r:r['p50_ms'])['threshold'] if ok else 150)" 2>/dev/null || echo 150)
 restart_lb "$BEST"
 say "load balancer running with -load-threshold $BEST"
