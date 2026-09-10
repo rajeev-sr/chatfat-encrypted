@@ -147,14 +147,22 @@ module.exports = {
   // the completeness check would report messages as lost that were in fact
   // stored. 60 000 covers a full submission with headroom while keeping the
   // serialised response near 10 MB, which matters in a 512 MB container.
-  FEED_LIMIT: int('FEED_LIMIT', 60000, 1, 200000),
-  FEED_MAX: int('FEED_MAX', 200000, 1, 1000000),
+  FEED_LIMIT: int('FEED_LIMIT', 150000, 1, 1000000),
+  FEED_MAX: int('FEED_MAX', 300000, 1, 2000000),
   // Connections per backend process. Three backends at this size must stay
   // comfortably under the server's max_connections.
   DB_POOL_MAX: int('DB_POOL_MAX', 10, 1, 500),
   DB_CONNECT_TIMEOUT_MS: int('DB_CONNECT_TIMEOUT_MS', 8000, 250, 60000),
   // Must stay above the load balancer's -idle-conn-timeout (30 s). See app.js.
   KEEPALIVE_TIMEOUT_MS: int('KEEPALIVE_TIMEOUT_MS', 65000, 1000, 600000),
+  // How often to refresh the /feed cache in the background. 0 disables it and
+  // returns /feed to rebuilding on demand.
+  FEED_WARM_MS: int('FEED_WARM_MS', 2000, 0, 600000),
+  // Group commit for POST /message. DB_BATCH_MAX of 1 disables it and returns
+  // to one insert per request. The window is short because the response waits
+  // for it: it is added latency, repaid many times over in throughput.
+  DB_BATCH_MAX: int('DB_BATCH_MAX', 50, 1, 1000),
+  DB_BATCH_MS: int('DB_BATCH_MS', 4, 1, 1000),
   // At-rest encryption of stored message text (requirement 3) and its keys
   // (requirement 4 rides on the same AEAD tag — see src/crypto/atRest.js).
   MASTER_KEYS,
