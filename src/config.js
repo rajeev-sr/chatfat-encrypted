@@ -131,6 +131,22 @@ module.exports = {
   // with ?work=N; 0 makes /bench a trivial JSON reply.
   BENCH_WORK: int('BENCH_WORK', 0, 0, 200000),
   BENCH_FAILURE_RATE: Number(str('BENCH_FAILURE_RATE', '0')) || 0,
+
+  // — Lab 6: HTTP message API (src/transport/api.js) —
+  // One room backs POST /message and GET /feed. Every backend derives the same
+  // room from the same name, which is what makes three processes share one
+  // conversation rather than three.
+  LAB_ROOM: str('LAB_ROOM', 'feed'),
+  // /feed is specified as "retrieves all messages", so the default is a cap
+  // high enough not to truncate a graded run rather than a page size. FEED_MAX
+  // bounds what an explicit ?limit= may ask for, so one request cannot be used
+  // to pull the whole table repeatedly.
+  FEED_LIMIT: int('FEED_LIMIT', 20000, 1, 200000),
+  FEED_MAX: int('FEED_MAX', 200000, 1, 1000000),
+  // Connections per backend process. Three backends at this size must stay
+  // comfortably under the server's max_connections.
+  DB_POOL_MAX: int('DB_POOL_MAX', 10, 1, 500),
+  DB_CONNECT_TIMEOUT_MS: int('DB_CONNECT_TIMEOUT_MS', 8000, 250, 60000),
   // At-rest encryption of stored message text (requirement 3) and its keys
   // (requirement 4 rides on the same AEAD tag — see src/crypto/atRest.js).
   MASTER_KEYS,

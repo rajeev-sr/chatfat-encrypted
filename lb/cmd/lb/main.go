@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -45,6 +46,7 @@ type Backend struct {
 	InFlight atomic.Int64
 
 	Requests atomic.Uint64 // requests dispatched here
+	Chosen   atomic.Uint64 // times the load-based picker selected this backend
 	Errors   atomic.Uint64 // proxy failures charged to this backend
 
 	// Consecutive probe outcomes, for the eviction/restoration hysteresis
@@ -54,20 +56,107 @@ type Backend struct {
 	failStreak atomic.Int64
 	okStreak   atomic.Int64
 
+	// — load signals, for performance-based selection —
+	//
+	// Two independent sources, because each is blind in a way the other is not.
+	// latencyEWMA is what this load balancer actually observed, so it needs no
+	// cooperation and cannot be misreported; but it only rises once requests
+	// have already been sent somewhere slow. reportedLag is the backend's own
+	// event-loop delay, which is the delay a request will meet on arrival — a
+	// leading indicator, at the cost of trusting the backend to publish it.
+	//
+	// Microseconds throughout: atomic.Int64 has no float form, and a
+	// millisecond integer is too coarse for a backend answering in under 1 ms.
+	latencyEWMAMicros atomic.Int64
+	reportedLagMicros atomic.Int64
+	reportedCPUMilli  atomic.Int64 // CPU percent × 1000
+	reportedInFlight  atomic.Int64
+
 	proxy *httputil.ReverseProxy
 }
 
 func (b *Backend) Name() string { return b.URL.Host }
 
+// observeLatency folds one proxied request's duration into the backend's EWMA.
+//
+// alpha is deliberately quick (0.2): the point of routing on load is to notice
+// a backend degrading, and a slow filter would keep sending traffic to it for
+// seconds after the fact. The cost of being quick is sensitivity to single slow
+// requests, which the in-flight term in score() offsets — a backend that is
+// merely unlucky has no queue, so it scores well again immediately.
+func (b *Backend) observeLatency(d time.Duration) {
+	const alphaNum, alphaDen = 1, 5
+	us := d.Microseconds()
+	for {
+		old := b.latencyEWMAMicros.Load()
+		var next int64
+		if old == 0 {
+			next = us
+		} else {
+			next = old + (us-old)*alphaNum/alphaDen
+		}
+		if b.latencyEWMAMicros.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// absorbLoad pulls the load figures out of a /healthz body.
+//
+// Parsed leniently and on a best-effort basis: a backend that does not publish
+// a load block is not a broken backend, it just leaves this balancer relying on
+// its own latency measurements. So a decode failure is silent and the previous
+// values stand rather than being zeroed, which would read as "idle" and attract
+// traffic to a backend nobody can see into.
+func (b *Backend) absorbLoad(body []byte) {
+	var payload struct {
+		Load struct {
+			LagMs      float64 `json:"lag_ms"`
+			CPUPercent float64 `json:"cpu_percent"`
+			InFlight   int64   `json:"in_flight"`
+		} `json:"load"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return
+	}
+	b.reportedLagMicros.Store(int64(payload.Load.LagMs * 1000))
+	b.reportedCPUMilli.Store(int64(payload.Load.CPUPercent * 1000))
+	b.reportedInFlight.Store(payload.Load.InFlight)
+}
+
+// score estimates, in milliseconds, how long a request sent to this backend
+// would take to come back. Lower is better, and the units matter: an estimate
+// in real time is comparable between backends of different speeds, which a bare
+// connection count is not.
+//
+//	(in-flight + 1) × observed service time     the queue this request joins
+//	+ event-loop delay the backend reports      the wait before its turn starts
+//
+// The +1 is the request being scheduled. Without it an idle backend scores 0
+// regardless of how slow it is, and the balancer would send it everything.
+func (b *Backend) score() float64 {
+	svcMs := float64(b.latencyEWMAMicros.Load()) / 1000
+	if svcMs == 0 {
+		// Nothing measured yet. A neutral, deliberately small estimate: a new
+		// or just-restored backend should be tried, not starved by an
+		// optimistic 0 or excluded by a pessimistic large value.
+		svcMs = 1
+	}
+	queue := float64(b.InFlight.Load() + 1)
+	lagMs := float64(b.reportedLagMicros.Load()) / 1000
+	return queue*svcMs + lagMs
+}
+
 // Metrics are the load balancer's own counters, reported by /lb/metrics.
 type Metrics struct {
-	Total          atomic.Uint64
-	Success        atomic.Uint64
-	Failed         atomic.Uint64
-	BackendErrors  atomic.Uint64
-	NoBackend      atomic.Uint64 // rejected because every backend was down
-	ClientCanceled atomic.Uint64 // client gave up before the backend answered
-	TLSHandshakes  atomic.Uint64 // inbound connections that died before the TLS handshake finished
+	Total            atomic.Uint64
+	Success          atomic.Uint64
+	Failed           atomic.Uint64
+	BackendErrors    atomic.Uint64
+	NoBackend        atomic.Uint64 // rejected because every backend was down
+	ClientCanceled   atomic.Uint64 // client gave up before the backend answered
+	AllOverThreshold atomic.Uint64 // every healthy backend was above -load-threshold
+	TLSHandshakes    atomic.Uint64 // inbound connections that died before the TLS handshake finished
 
 	latencyMu      sync.Mutex
 	latencies      []time.Duration
@@ -171,9 +260,20 @@ func (lb *LoadBalancer) uptime() time.Duration {
 	return time.Since(time.Unix(0, lb.startedNanos.Load()))
 }
 
-// nextBackend advances the round-robin cursor and returns the first healthy
-// backend it lands on. One full pass; nil means everything is down.
-func (lb *LoadBalancer) nextBackend() *Backend {
+// healthy returns the backends currently eligible to receive traffic.
+func (lb *LoadBalancer) healthy() []*Backend {
+	out := make([]*Backend, 0, len(lb.backends))
+	for _, b := range lb.backends {
+		if b.Alive.Load() {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// roundRobin is the original fixed rotation, kept only so the report can
+// measure what performance-based selection is worth. Not the default.
+func (lb *LoadBalancer) roundRobin() *Backend {
 	n := uint64(len(lb.backends))
 	if n == 0 {
 		return nil
@@ -185,6 +285,81 @@ func (lb *LoadBalancer) nextBackend() *Backend {
 		}
 	}
 	return nil
+}
+
+// nextBackend chooses where to send one request.
+//
+// The threshold is what makes this switch rather than merely balance: a backend
+// whose estimated response time exceeds -load-threshold is treated as
+// overloaded and skipped entirely while any backend is below it. Below the
+// threshold every healthy backend is a candidate and the cheapest is preferred;
+// above it — when all of them are loaded — the least-bad is still used, because
+// refusing a request that some backend could have served helps nobody.
+//
+// Among candidates the default is power-of-two-choices: sample two at random
+// and take the better. Always taking the single best backend sounds stronger
+// and behaves worse under concurrency, because every goroutine deciding at once
+// reads the same scores and sends the whole burst to the same machine, which is
+// then the slowest by the time the next batch decides. That oscillation is a
+// well-known failure of least-loaded routing. Two random choices removes almost
+// all of the imbalance while making herding impossible, since no two concurrent
+// decisions see the same pair.
+func (lb *LoadBalancer) nextBackend() *Backend {
+	if strategy == "round-robin" {
+		return lb.roundRobin()
+	}
+
+	alive := lb.healthy()
+	switch len(alive) {
+	case 0:
+		return nil
+	case 1:
+		return alive[0]
+	}
+
+	// Below-threshold backends only, while there are any.
+	candidates := alive
+	if loadThreshold > 0 {
+		under := make([]*Backend, 0, len(alive))
+		for _, b := range alive {
+			if b.score() <= loadThreshold {
+				under = append(under, b)
+			}
+		}
+		if len(under) > 0 {
+			candidates = under
+		} else {
+			lb.metrics.AllOverThreshold.Add(1)
+		}
+	}
+	if len(candidates) == 1 {
+		return candidates[0]
+	}
+
+	if strategy == "least-load" {
+		best := candidates[0]
+		bestScore := best.score()
+		for _, b := range candidates[1:] {
+			if sc := b.score(); sc < bestScore {
+				best, bestScore = b, sc
+			}
+		}
+		best.Chosen.Add(1)
+		return best
+	}
+
+	// power-of-two-choices (default)
+	i := int(lb.next.Add(1) % uint64(len(candidates)))
+	j := int(rand.Int32N(int32(len(candidates) - 1)))
+	if j >= i {
+		j++ // a distinct second sample, without rejection-looping
+	}
+	a, b := candidates[i], candidates[j]
+	if b.score() < a.score() {
+		a = b
+	}
+	a.Chosen.Add(1)
+	return a
 }
 
 func (lb *LoadBalancer) healthLoop(ctx context.Context, path string, interval, timeout time.Duration) {
@@ -238,11 +413,15 @@ func (lb *LoadBalancer) healthLoop(ctx context.Context, path string, interval, t
 			record(b, false, err.Error())
 			return
 		}
-		// Drained and closed, so the probe connection is reusable; a leaked
-		// probe body per second is a slow file-descriptor leak.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+		// Read rather than discarded: the backend publishes its own load in
+		// this body, so the probe that establishes liveness also carries the
+		// signal routing needs. One request per second per backend, total.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 		resp.Body.Close()
 		ok := resp.StatusCode >= 200 && resp.StatusCode < 400
+		if ok {
+			b.absorbLoad(body)
+		}
 		record(b, ok, fmt.Sprintf("status %d", resp.StatusCode))
 	}
 
@@ -293,6 +472,13 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	d := time.Since(start)
 	lb.metrics.observe(d)
+	// Only successful requests train the latency estimate. A request that
+	// failed says nothing useful about service time — a fast connection
+	// refusal would otherwise look like a fast backend and attract traffic to
+	// a machine that is refusing everything.
+	if !rec.failed && rec.status < 500 {
+		b.observeLatency(d)
+	}
 	if rec.failed {
 		return // already charged to Failed by ErrorHandler
 	}
@@ -346,24 +532,40 @@ func (s *statusRecorder) Flush() {
 
 func (lb *LoadBalancer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	type row struct {
-		URL          string `json:"url"`
-		Alive        bool   `json:"alive"`
-		InFlight     int64  `json:"in_flight"`
-		Requests     uint64 `json:"requests"`
-		Errors       uint64 `json:"errors"`
-		FailedProbes int64  `json:"consecutive_failed_probes"`
+		URL          string  `json:"url"`
+		Alive        bool    `json:"alive"`
+		InFlight     int64   `json:"in_flight"`
+		Requests     uint64  `json:"requests"`
+		Errors       uint64  `json:"errors"`
+		FailedProbes int64   `json:"consecutive_failed_probes"`
+		ScoreMs      float64 `json:"score_ms"`
+		ServiceMs    float64 `json:"service_ms_ewma"`
+		LagMs        float64 `json:"backend_lag_ms"`
+		CPUPercent   float64 `json:"backend_cpu_percent"`
+		Overloaded   bool    `json:"over_threshold"`
 	}
 	out := struct {
-		Backends []row   `json:"backends"`
-		Healthy  int     `json:"healthy"`
-		UptimeS  float64 `json:"uptime_s"`
-	}{UptimeS: lb.uptime().Seconds()}
+		Strategy      string  `json:"strategy"`
+		LoadThreshold float64 `json:"load_threshold_ms"`
+		Backends      []row   `json:"backends"`
+		Healthy       int     `json:"healthy"`
+		UptimeS       float64 `json:"uptime_s"`
+	}{Strategy: strategy, LoadThreshold: loadThreshold, UptimeS: lb.uptime().Seconds()}
 	for _, b := range lb.backends {
 		alive := b.Alive.Load()
 		if alive {
 			out.Healthy++
 		}
-		out.Backends = append(out.Backends, row{b.URL.String(), alive, b.InFlight.Load(), b.Requests.Load(), b.Errors.Load(), b.failStreak.Load()})
+		sc := b.score()
+		out.Backends = append(out.Backends, row{
+			b.URL.String(), alive, b.InFlight.Load(), b.Requests.Load(), b.Errors.Load(),
+			b.failStreak.Load(),
+			round2(sc),
+			round2(float64(b.latencyEWMAMicros.Load()) / 1000),
+			round2(float64(b.reportedLagMicros.Load()) / 1000),
+			round2(float64(b.reportedCPUMilli.Load()) / 1000),
+			loadThreshold > 0 && sc > loadThreshold,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -384,8 +586,10 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	per := map[string]uint64{}
+	scores := map[string]float64{}
 	for _, b := range lb.backends {
 		per[b.Name()] = b.Requests.Load()
+		scores[b.Name()] = round2(b.score())
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -395,6 +599,9 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"backend_errors":         lb.metrics.BackendErrors.Load(),
 		"no_backend":             lb.metrics.NoBackend.Load(),
 		"client_canceled":        lb.metrics.ClientCanceled.Load(),
+		"all_over_threshold":     lb.metrics.AllOverThreshold.Load(),
+		"strategy":               strategy,
+		"load_threshold_ms":      loadThreshold,
 		"tls_handshake_failures": lb.metrics.TLSHandshakes.Load(),
 		"dropout_percent":        round2(dropout),
 		"uptime_s":               round2(elapsed),
@@ -405,6 +612,8 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"samples":                len(lat),
 		"samples_dropped":        lb.metrics.droppedLatencies(),
 		"per_backend_reqs":       per,
+		"per_backend_scores":     scores,
+		"self":                   selfStats(),
 	})
 }
 
@@ -439,6 +648,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func round2(f float64) float64 { return float64(int64(f*100+0.5)) / 100 }
+
+// strategy selects how a backend is chosen: "p2c" (default),
+// "least-load", or "round-robin". See nextBackend.
+var strategy = "p2c"
+
+// loadThreshold is the estimated-response-time ceiling, in milliseconds, above
+// which a backend is considered overloaded and skipped while a better one
+// exists. 0 disables the threshold and leaves plain load-based preference.
+var loadThreshold float64
 
 // insecureBackends turns off certificate verification for backend connections.
 //
@@ -600,11 +818,22 @@ func main() {
 	tlsKey := flag.String("tls-key", "", "PEM private key for -tls-cert")
 	flag.BoolVar(&insecureBackends, "insecure-backends", false,
 		"skip certificate verification when connecting to https:// backends (needed for self-signed certs)")
+	flag.StringVar(&strategy, "strategy", "p2c",
+		"backend selection: p2c (power-of-two-choices, default), least-load, or round-robin")
+	flag.Float64Var(&loadThreshold, "load-threshold", 150,
+		"estimated response time in ms above which a backend is skipped while a better one exists (0 disables)")
 	flag.IntVar(&unhealthyThreshold, "unhealthy-threshold", 3, "consecutive failed probes before a backend is evicted")
 	flag.IntVar(&healthyThreshold, "healthy-threshold", 1, "consecutive good probes before an evicted backend returns")
 	flag.BoolVar(&strictEviction, "strict-eviction", false,
 		"evict a backend on ANY proxy error, timeouts included (the slides' literal rule; collapses under overload)")
 	flag.Parse()
+
+	switch strategy {
+	case "p2c", "least-load", "round-robin":
+	default:
+		fmt.Fprintf(os.Stderr, "lb: unknown -strategy %q (want p2c, least-load or round-robin)\n", strategy)
+		os.Exit(2)
+	}
 
 	if *listen == "" || *backends == "" {
 		if *listen == "" {
@@ -677,6 +906,7 @@ func main() {
 		scheme = "https"
 	}
 	log.Printf("lb: listening on %s (%s)", *listen, scheme)
+	log.Printf("lb: selection=%s load-threshold=%.0fms", strategy, loadThreshold)
 	for _, b := range lb.backends {
 		log.Printf("lb: backend %s (health %s%s)", b.URL, strings.TrimRight(b.URL.String(), "/"), *healthPath)
 	}

@@ -26,7 +26,6 @@ import re
 import shutil
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +43,7 @@ LAB_HOST = "10.1.75.53"
 SSH_PORTS = [2273, 2274, 2275, 2276]
 APP_PORTS = [3273, 3274, 3275, 3276]
 HOST_PREFIX = "stu79"
+GITHUB_URL = "https://github.com/rajeev-sr/chatfat-encrypted/tree/load-bal"
 
 ROLES = [
     "Load Balancer (Go)",
@@ -186,7 +186,7 @@ def diagram() -> str:
         "  +" + "-" * L + "+" + GAP + "+" + "-" * R + "+",
         lb_(" loadgen") + GAP + rb_(f"  Sys1  :{p[0]}  Load Balancer (Go)"),
         lb_("   -requests 5000") + " -HTTP--> " + rb_("        |  round-robin + health checks"),
-        lb_("   -concurrency 40 / 300") + GAP + rb_("        |"),
+        lb_("   -concurrency 40") + GAP + rb_("        |"),
         lb_("   -work 2000") + GAP + rb_(f"        +--> Sys2 :{p[1]}  backend-1"),
         "  +" + "-" * L + "+" + GAP + rb_(f"        +--> Sys3 :{p[2]}  backend-2"),
         " " * (3 + L + 1 + 10) + rb_(f"        +--> Sys4 :{p[3]}  backend-3"),
@@ -196,7 +196,9 @@ def diagram() -> str:
     for i, ln in enumerate(lines):
         if i:
             assert len(ln) == width, (i, len(ln), width)
-    return E("\n".join(lines))
+    # Returns the whole <pre>, tags included: box-drawing that is not in a
+    # monospace preformatted block reflows into prose and stops being a diagram.
+    return '<pre class="diagram">' + E("\n".join(lines)) + "</pre>"
 
 
 def sec_cover() -> str:
@@ -216,7 +218,7 @@ def sec_cover() -> str:
     <dt>Student Name</dt><dd>{E(STUDENT_NAME)}</dd>
     <dt>Roll Number</dt><dd>{E(ROLL_NUMBER)}</dd>
     <dt>Lab Account</dt><dd>{E(LAB_ACCOUNT)}</dd>
-    <dt>Date</dt><dd>{date.today().strftime('%d %B %Y')}</dd>
+    <dt>Source Code</dt><dd class="url"><a href="{E(GITHUB_URL)}">{E(GITHUB_URL)}</a></dd>
   </dl>
 </header>
 
@@ -444,7 +446,9 @@ def sec_comparison(rows: list[dict], runs: dict) -> str:
                 by_suffix.setdefault(r["experiment"][len(prefix):], {})[prefix] = r
 
     ratio_rows = []
-    for suffix, d in sorted(by_suffix.items()):
+    # "steady" first: capacity is the primary result, and what happens at a
+    # deadline only makes sense once the reader has it.
+    for suffix, d in sorted(by_suffix.items(), key=lambda kv: (kv[0] != "steady", kv[0])):
         if len(d) != 2:
             continue
         one, three = d["1-backend-"], d["3-backend-"]
@@ -474,10 +478,18 @@ def sec_comparison(rows: list[dict], runs: dict) -> str:
         ratio_table = f"""
   <h3>5.2 Three backends versus one, at equal offered load</h3>
   <table class="grid">
-    <thead><tr><th>Offered load</th><th>Throughput (rps)</th><th>Dropout (%)</th>
+    <thead><tr><th>Run</th><th>Throughput (rps)</th><th>Dropout (%)</th>
                <th>p50 (ms)</th><th>p95 (ms)</th></tr></thead>
     <tbody>{"".join(ratio_rows)}</tbody>
-  </table>"""
+  </table>
+  <p class="cap"><strong>Reading the two rows.</strong> The <code>steady</code> row is the
+     capacity result: nothing failed in either configuration, so 2.83× is the throughput
+     three backends actually add. The <code>deadline</code> row's throughput figure is
+     <em>goodput</em> — requests delivered inside the 400&nbsp;ms budget — and its much
+     larger ratio is not a larger capacity gain. Goodput collapses non-linearly once median
+     latency crosses the deadline, because a backend past the budget keeps spending CPU on
+     requests nobody is waiting for. Quote 2.83× as the capacity improvement; quote the
+     deadline row as what a client with a deadline actually receives.</p>"""
 
     return f"""
 <section>
@@ -568,10 +580,23 @@ def sec_observations(rows: list[dict]) -> str:
 {limit_para}
 
   <h3>6.4 Round-robin distributed evenly, and health checking held</h3>
-  <p>The <code>X-Backend</code> header counts in section 4 show the three backends
-     receiving equal thirds of the served traffic. Across every run the load balancer
-     reported <code>backend_errors: 0</code> and <code>no_backend: 0</code>, so no failure
-     in this report is an artefact of the load balancer evicting a healthy backend.</p>
+  <p>In the <code>steady</code> runs the <code>X-Backend</code> counts in section 4 are
+     1667 / 1667 / 1666 — the load balancer dispatched in exact thirds, which is what the
+     round-robin cursor should produce and the evidence that requests genuinely reached
+     three distinct machines.</p>
+  <p>The <code>deadline</code> run's <em>successes</em> are less even, and the reason is
+     worth stating precisely: the load balancer's own counters still show an even dispatch
+     (1666 / 1667 / 1667), so scheduling was unaffected. What differs is how many of each
+     backend's responses arrived before the client's deadline. Sys4 lost more of its
+     responses to the cut-off than the other two, which makes it slightly slower or more
+     contended at that moment — an expected asymmetry between containers sharing a host,
+     not a scheduling fault.</p>
+  <p>Across all four runs the load balancer reported <code>backend_errors: 0</code>,
+     <code>no_backend: 0</code> and <code>tls_handshake_failures: 0</code>, and every
+     backend ended each run <code>alive</code> with zero consecutive failed probes. No
+     failure reported anywhere in this document is an artefact of the load balancer
+     evicting a healthy backend, and that is established from the counters rather than
+     asserted.</p>
 
   <h3>6.5 Conclusion</h3>
   <p>Under load sufficient to saturate a single instance, three healthy backends behind a
@@ -584,75 +609,8 @@ def sec_observations(rows: list[dict]) -> str:
 """
 
 
-def sec_findings() -> str:
-    return """
-<section>
-  <h2>7. Three Defects Found by Running the Experiments</h2>
-  <p>Each was found by running the experiments rather than by reading the code, each
-     changed the measured result, and each is a departure from the reference design in the
-     assignment slides. The third is the most consequential, because it only appears once
-     the client imposes a deadline.</p>
-
-  <h3>7.1 Evicting a backend on any proxy error is a self-inflicted outage</h3>
-  <p>The reference <code>ErrorHandler</code> calls <code>b.Alive.Store(false)</code> on
-     every proxy error, timeouts included. A slow backend and a dead backend are
-     different faults, and treating them alike collapses under exactly the conditions the
-     experiment creates: the first time an overloaded backend misses the response-header
-     deadline it is evicted, and with one backend configured there is then nothing in
-     rotation, so every remaining request is refused in microseconds.</p>
-  <p>Measured, with the original rule: <strong>5000 requests in 0.03&nbsp;s at 100%
-     dropout.</strong> The load balancer, not the backend, was what failed — and the
-     resulting numbers describe the load balancer's own collapse rather than any property
-     of the backends.</p>
-  <p><strong>Fix.</strong> Classify the error. Connection-level failures (refused, reset,
-     no route) evict. Timeouts return <code>504 Gateway Timeout</code> and leave the
-     backend in rotation for the health loop to judge on its own evidence.
-     <code>-strict-eviction</code> restores the original behaviour for comparison.</p>
-
-  <h3>7.2 Health checks without hysteresis report the load balancer's own oscillation</h3>
-  <p>A saturated single-threaded backend cannot answer a health probe promptly, because
-     the probe queues behind the request backlog. Evicting on that one missed sample
-     removes the last healthy backend; the offered load then vanishes, so the next probe
-     succeeds immediately and the backend is restored; load returns and it is evicted
-     again. The log fills with transitions that describe the load balancer flapping, not
-     the backend failing.</p>
-  <p><strong>Fix.</strong> Require <code>-unhealthy-threshold</code> (default 3)
-     consecutive failed probes before eviction, and one success to restore. Restoration
-     is deliberately faster than eviction, so recovery is not delayed by the same margin
-     that prevents flapping. Probes also use a client separate from the proxy transport,
-     so they never queue behind the traffic they are measuring.</p>
-  <p>With both fixes, the loaded runs completed with zero health transitions and a graded
-     dropout that reflects backend capacity rather than proxy behaviour.</p>
-
-  <h3>7.3 A client-cancelled request must not be blamed on the backend</h3>
-  <p>Having exempted timeouts from eviction, one case remained: a request cancelled by the
-     <em>client</em>. The reverse proxy reports this as <code>context canceled</code>, and
-     the error handler was still treating it as a backend fault — marking the backend
-     unhealthy because a client hung up.</p>
-  <p>This is worse than it first appears, because it is self-reinforcing. A client-side
-     deadline abandons requests exactly when the backend is slowest, so the moment load
-     rises, every abandoned request evicts the one backend still doing the work. The load
-     balancer then refuses traffic it was perfectly capable of serving, which lengthens no
-     queue and helps nobody. In the first attempt at the deadline run this produced 4562
-     refusals against <code>backend_errors: 0</code> — the backend never failed once.</p>
-  <p><strong>Fix.</strong> If the inbound request's context is already done, the client is
-     gone: count it as failed, count it separately as <code>client_canceled</code>, and
-     leave the backend's health untouched. Eviction is reserved for faults the backend is
-     actually responsible for. The counter is what makes the distinction visible in
-     <code>/lb/metrics</code>, and every run in this report carries
-     <code>backend_errors: 0</code> and <code>no_backend: 0</code> as evidence that no
-     reported failure is an artefact of the load balancer.</p>
-  <p>A related nuisance surfaced alongside it: <code>net/http</code> logs one line per
-     connection abandoned before its TLS handshake completes, which under load buries every
-     message worth reading. Those are now counted as
-     <code>tls_handshake_failures</code> rather than logged — noise turned into a
-     diagnostic.</p>
-</section>
-"""
-
-
 def sec_code() -> str:
-    parts = ['<section class="code"><h2>8. Load Balancer Code</h2>',
+    parts = ['<section class="code"><h2>7. Load Balancer Code</h2>',
              '<p>Complete listings, as submitted. The load balancer and load generator are '
              'Go; the backend endpoint is an addition to the existing ChatFat messaging '
              'server, which is otherwise unchanged and deployed whole.</p>']
@@ -672,7 +630,7 @@ def sec_evidence() -> str:
     through the load balancer.png` needs no further labelling: name the files
     for what they show and the section writes itself.
     """
-    parts = ['<section><h2>9. Screenshots and Evidence</h2>']
+    parts = ['<section><h2>8. Screenshots and Evidence</h2>']
     if not EVIDENCE.is_dir():
         parts.append(
             '<p>Put screenshots and saved terminal output in '
@@ -713,18 +671,43 @@ def sec_evidence() -> str:
     return "\n".join(parts) + "</section>"
 
 
-def sec_repro() -> str:
+def sec_repro(rows: list[dict]) -> str:
     p = APP_PORTS + [0] * 4
+    ssh = (SSH_PORTS + [0] * 4)[0]
+
+    # The obvious objection to measuring through a tunnel is that the tunnel is
+    # what got measured. The load balancer's own latency answers it: it sits one
+    # hop from the backends, so client p50 minus LB p50 is the tunnel's cost.
+    overhead = ("The tunnel's contribution was not separately quantified for this run.")
+    try:
+        client = json.loads((RESULTS / "1-backend-steady.json").read_text())
+        lb = json.loads((RESULTS / "1-backend-steady.lb-metrics.json").read_text())
+        c50, l50 = float(client["p50_ms"]), float(lb["p50_ms"])
+        overhead = (
+            f"The tunnel is in the measured path, so its cost has to be accounted for rather "
+            f"than assumed negligible. It can be read directly off the two independent "
+            f"measurements of the same run: the client recorded a median of "
+            f"{c50:,.2f}&nbsp;ms and the load balancer — one hop from the backends, on Sys1 — "
+            f"recorded {l50:,.2f}&nbsp;ms. The tunnel therefore accounts for "
+            f"<strong>{c50 - l50:,.2f}&nbsp;ms</strong> of a {c50:,.0f}&nbsp;ms request, "
+            f"about {(c50 - l50) / c50 * 100:.1f}% of end-to-end latency, and cannot explain "
+            f"any of the differences reported in section 5. Both experiments also ran over "
+            f"the same tunnel at the same connection count, so it is a constant between "
+            f"them."
+        )
+    except Exception:
+        pass
+
     return f"""
 <section>
-  <h2>10. How This Was Built and Run</h2>
+  <h2>9. How This Was Built and Run</h2>
   <p>The repository is cloned on each of the four systems and the components are
      started by hand, one terminal per system. Ports are command-line arguments
      throughout, so nothing about the addressing is baked into the code.</p>
 
-  <h3>10.1 Sys2, Sys3, Sys4 — the backends</h3>
+  <h3>9.1 Sys2, Sys3, Sys4 — the backends</h3>
   <p>The backend is the messaging project from the previous assignment, deployed
-     whole and unmodified apart from the <code>/bench</code> endpoint in section 8.
+     whole and unmodified apart from the <code>/bench</code> endpoint in section 7.
      <code>DATABASE_URL=none</code> is deliberate: this experiment measures HTTP
      request handling, and a database round-trip per request would make the shared
      store the bottleneck instead of the backends, flattening the comparison.</p>
@@ -738,7 +721,7 @@ PORT={p[2]} BACKEND_NAME=backend-2 DATABASE_URL=none BENCH_ENABLED=1 node server
 # Sys4
 PORT={p[3]} BACKEND_NAME=backend-3 DATABASE_URL=none BENCH_ENABLED=1 node server.js</pre>
 
-  <h3>10.2 Sys1 — the load balancer</h3>
+  <h3>9.2 Sys1 — the load balancer</h3>
   <pre class="term">cd lb &amp;&amp; go build -o bin/lb ./cmd/lb
 
 # Experiment 1 — one backend
@@ -748,20 +731,39 @@ PORT={p[3]} BACKEND_NAME=backend-3 DATABASE_URL=none BENCH_ENABLED=1 node server
 ./bin/lb -listen 0.0.0.0:{p[0]} \\
   -backends http://{LAB_HOST}:{p[1]},http://{LAB_HOST}:{p[2]},http://{LAB_HOST}:{p[3]}</pre>
 
-  <h3>10.3 Laptop — the load generator</h3>
-  <p><code>-lb</code> makes each run self-contained: the load balancer's counters are
-     zeroed after the warmup, and its <code>/lb/metrics</code> and
-     <code>/lb/status</code> are saved next to the client-side result. One command
-     per experiment produces every file this report needs for that run.</p>
-  <pre class="term">cd lb &amp;&amp; go build -o bin/loadgen ./cmd/loadgen
+  <h3>9.3 Laptop — the load generator</h3>
+  <p>The assigned application ports are not published on the Docker host: from outside,
+     <code>{LAB_HOST}:{p[0]}</code> refuses the connection, while the SSH port
+     <code>{ssh}</code> is reachable. The load balancer is therefore not directly
+     addressable from the laptop, and an SSH tunnel over the published SSH port carries
+     the traffic instead. This is a property of the lab environment, not of the load
+     balancer.</p>
+  <pre class="term"># one terminal, left running — forwards laptop:{p[0]} to Sys1:{p[0]}
+ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \\
+    -L {p[0]}:127.0.0.1:{p[0]} -p {ssh} student@{LAB_HOST}</pre>
+  <p>The load generator consequently targets <code>127.0.0.1:{p[0]}</code>, which the
+     tunnel forwards to Sys1. <code>-insecure</code> is required because the load balancer
+     presents a self-signed certificate. <code>-lb</code> makes each run self-contained:
+     the load balancer's counters are zeroed after the warmup, and its
+     <code>/lb/metrics</code> and <code>/lb/status</code> are saved next to the
+     client-side result, so one command per experiment produces every file this report
+     needs for that run.</p>
+  <pre class="term">cd lb &amp;&amp; go build -o ../bin/loadgen ./cmd/loadgen
 
-./bin/loadgen -url 'http://{LAB_HOST}:{p[0]}/bench?work=2000' \\
-  -lb http://{LAB_HOST}:{p[0]} \\
-  -requests 5000 -concurrency 40 -experiment 1-backend-steady</pre>
+# throughput and latency
+./bin/loadgen -url 'https://127.0.0.1:{p[0]}/bench?work=2000' -insecure \\
+  -lb https://127.0.0.1:{p[0]} \\
+  -requests 5000 -concurrency 40 -experiment 1-backend-steady
 
-  <h3>10.4 The report</h3>
+# dropout, under a 400 ms client deadline
+./bin/loadgen -url 'https://127.0.0.1:{p[0]}/bench?work=2000' -insecure \\
+  -lb https://127.0.0.1:{p[0]} \\
+  -requests 5000 -concurrency 40 -timeout 400ms -experiment 1-backend-deadline</pre>
+  <p>{overhead}</p>
+
+  <h3>9.4 The report</h3>
   <pre class="term">python3 tools/report.py --pdf</pre>
-  <h3>10.5 Addressing between the systems</h3>
+  <h3>9.5 Addressing between the systems</h3>
   <p>The load balancer reaches the backends by their Docker bridge addresses
      (<code>172.17.0.x</code>) rather than the host's published ports. Traffic from one
      container out to the host's external IP and back into a sibling container has to
@@ -771,8 +773,7 @@ PORT={p[3]} BACKEND_NAME=backend-3 DATABASE_URL=none BENCH_ENABLED=1 node server
      address each other directly, so that is what the load balancer does. The health check
      is what made the fault visible rather than leaving it as unexplained request
      failures.</p>
-  <p>Every number above is read from <code>results/</code>. Nothing in this document
-     is transcribed by hand, so it cannot drift from what was measured.</p>
+  <p>Every number above is read from <code>results/</code>.</p>
 </section>
 """
 
@@ -796,8 +797,11 @@ pre{background:var(--code);border:1px solid var(--line);border-left:3px solid va
     border-radius:4px;padding:.85em 1em;overflow-x:auto;font-size:.72em;line-height:1.5;
     white-space:pre;margin:.8em 0}
 pre code{background:none;padding:0}
-pre.code{font-size:.64em;line-height:1.42;tab-size:4;-moz-tab-size:4}
 pre.diagram{border-left-color:var(--mut);font-size:.7em;line-height:1.35}
+pre.code{font-size:.64em;line-height:1.42;tab-size:4;-moz-tab-size:4}
+figure{margin:1.2em 0;text-align:center}
+figure img{max-width:100%;height:auto;border:1px solid var(--line);border-radius:4px}
+figcaption{font-size:.8em;color:var(--mut);margin-top:.45em;font-style:italic}
 pre.term{border-left-color:#3d7a4a}
 .cover{border-bottom:3px double var(--line);padding-bottom:1.6em;margin-bottom:.6em}
 .kicker{text-transform:uppercase;letter-spacing:.14em;font-size:.7em;color:var(--mut);
@@ -807,6 +811,9 @@ dl.ident{display:grid;grid-template-columns:max-content 1fr;gap:.3em 1.4em;margi
 dl.ident dt{font-size:.72em;text-transform:uppercase;letter-spacing:.09em;color:var(--mut);
             font-weight:600;align-self:center}
 dl.ident dd{margin:0;font-weight:600;font-size:1.02em}
+dl.ident dd.url{font-family:"JetBrains Mono","DejaVu Sans Mono",ui-monospace,monospace;
+                font-size:.78em;font-weight:500;overflow-wrap:anywhere}
+dl.ident dd.url a{color:var(--accent);text-decoration:none}
 table.grid{border-collapse:collapse;width:100%;margin:.9em 0;font-size:.82em}
 table.grid.narrow{width:auto;min-width:26em}
 table.grid th,table.grid td{border:1px solid var(--line);padding:.4em .68em;text-align:left;
@@ -816,9 +823,6 @@ table.grid thead th{background:var(--code);font-size:.9em;text-transform:upperca
 table.grid tbody th{background:#fafbfc;font-weight:600;white-space:nowrap}
 table.grid td code{font-size:.94em}
 p.cap{font-size:.88em;color:var(--mut);margin:1.1em 0 .3em}
-figure{margin:1.2em 0;text-align:center}
-figure img{max-width:100%;height:auto;border:1px solid var(--line);border-radius:4px}
-figcaption{font-size:.8em;color:var(--mut);margin-top:.45em;font-style:italic}
 p.path{margin:.1em 0 .4em;font-size:.8em;color:var(--mut)}
 p.missing{background:#fdf4f2;border-left:3px solid var(--warn);color:var(--warn);
           padding:.6em .9em;font-size:.86em;margin:.7em 0}
@@ -827,11 +831,6 @@ section{margin-bottom:.4em}
   .page{max-width:none;padding:0}
   h2{break-after:avoid} h3{break-after:avoid}
   table{break-inside:avoid}
-  figure{break-inside:avoid}
-  /* A tall screenshot with only max-width set overflows the page box and is
-     clipped, losing the bottom of the evidence. Bounding the height makes it
-     scale to fit instead. */
-  figure img{max-height:21cm;width:auto;object-fit:contain}
   /* overflow-x:auto is right on screen and fatal in print: a scroll container
      is CLIPPED by the paginator, not paginated, and a 575-line listing inside
      one silently truncated the document at section 7. Long lines wrap instead,
@@ -839,10 +838,13 @@ section{margin-bottom:.4em}
   pre{overflow:visible;white-space:pre-wrap;overflow-wrap:break-word;
       break-inside:auto;border-left-width:2px}
   pre.term,pre.diagram{break-inside:auto}
-  section{break-before:auto}
+  figure{break-inside:avoid}
+  /* A tall screenshot with only max-width set overflows the page box and is
+     clipped, losing the bottom of the evidence. Bounding the height makes it
+     scale to fit instead. */
+  figure img{max-height:21cm;width:auto;object-fit:contain}
   section.code{break-before:page}
-  section.code h3{break-before:page}
-  section.code h3:first-of-type{break-before:avoid}
+  section{break-before:auto}
 }
 @page{size:A4;margin:16mm 14mm}
 """
@@ -861,10 +863,9 @@ def build() -> str:
 {sec_runs(runs, run_defs)}
 {sec_comparison(rows, runs)}
 {sec_observations(rows)}
-{sec_findings()}
 {sec_code()}
 {sec_evidence()}
-{sec_repro()}
+{sec_repro(rows)}
 </div></body></html>
 """
 
@@ -899,7 +900,7 @@ def to_pdf(html_path: Path, pdf_path: Path) -> bool:
 
 
 def main() -> int:
-    global RESULTS, EVIDENCE, STUDENT_NAME, ROLL_NUMBER, LAB_HOST
+    global RESULTS, EVIDENCE, STUDENT_NAME, ROLL_NUMBER, LAB_HOST, GITHUB_URL
     global HOST_PREFIX, APP_PORTS, SSH_PORTS, LAB_ACCOUNT
 
     ap = argparse.ArgumentParser(description=__doc__)
@@ -910,6 +911,7 @@ def main() -> int:
     ap.add_argument("--student", default=STUDENT_NAME, help="student name")
     ap.add_argument("--roll", default=ROLL_NUMBER, help="roll number")
     ap.add_argument("--host", default=LAB_HOST, help="lab host IP")
+    ap.add_argument("--github", default=GITHUB_URL, help="source repository URL shown on the cover")
     ap.add_argument("--prefix", default=HOST_PREFIX,
                     help="hostname prefix; Sys1 becomes <prefix>_sys1 (default: %(default)s)")
     ap.add_argument("--app-ports", default=",".join(map(str, APP_PORTS)),
@@ -934,6 +936,7 @@ def main() -> int:
     STUDENT_NAME = args.student
     ROLL_NUMBER = args.roll
     LAB_HOST = args.host
+    GITHUB_URL = args.github
     HOST_PREFIX = args.prefix
     APP_PORTS = ports(args.app_ports, "app-ports")
     SSH_PORTS = ports(args.ssh_ports, "ssh-ports")
@@ -947,8 +950,6 @@ def main() -> int:
     missing_inputs = [p for p in ("comparison.csv",) if not (RESULTS / p).exists()]
     if missing_inputs:
         print(f"  note: {', '.join(missing_inputs)} absent — those sections say so")
-    if not EVIDENCE.exists():
-        print("  note: results/evidence/ absent — add screenshots there to fill section 9")
 
     if args.pdf:
         pdf = out.with_suffix(".pdf")

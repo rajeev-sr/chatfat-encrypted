@@ -35,11 +35,16 @@ function getPool() {
   if (pool) return pool;
   if (!config.USE_POSTGRES) throw new Error('Postgres is not configured.');
 
+  // Pool size is a deployment property, not a code constant. Ten is right for
+  // a database an internet away, where the round trip dominates and more
+  // connections only queue in a different place; it is far too few for one on
+  // the same host, where a query costs well under a millisecond and the pool
+  // becomes the bottleneck long before the database does.
   const opts = {
     connectionString: config.DATABASE_URL,
-    max: 10,
+    max: config.DB_POOL_MAX,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 8000,
+    connectionTimeoutMillis: config.DB_CONNECT_TIMEOUT_MS,
   };
 
   if (isNeonHost(config.DATABASE_URL)) {
