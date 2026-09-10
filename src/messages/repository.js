@@ -204,10 +204,10 @@ class MemoryRepo {
     if (limit <= 0) return [];
     const out = [];
     for (const { roomId: rid, m } of this.rows.values()) {
-      if (rid === roomId && !m.unsent) out.push({ id: m.id, ts: m.ts });
+      if (rid === roomId && !m.unsent) out.push(m);
     }
     out.sort(byTsThenId);
-    return out.slice(-limit);
+    return out.slice(-limit).map((m) => m.id);
   }
 
   // Same contract as PgRepo.byIds.
@@ -363,14 +363,12 @@ class PgRepo {
     return res.rows.map(rowToMessage);
   }
 
-  // The identity of every message in the feed — id and timestamp only — newest
-  // `limit` first, returned oldest-first.
+  // The ids of every message in the feed, oldest first, capped at `limit`
+  // (newest kept).
   //
   // This is what /feed is built on, and it deliberately reads no message text.
-  // The (room_id, ts desc, id desc) index covers both columns, so Postgres
-  // answers it without touching the heap: at 40 000 messages it moves about a
-  // megabyte and costs tens of milliseconds, where fetching the rows themselves
-  // meant transferring every ciphertext and decrypting it.
+  // The (room_id, ts desc, id desc) index covers id and ts, so Postgres answers
+  // it without touching the heap.
   //
   // It replaced a `(ts, id) > watermark` cursor, which cannot be trusted here.
   // Messages are inserted in batches, and batches become visible in commit
@@ -381,20 +379,26 @@ class PgRepo {
   // returned nothing at all — one whole batch, invisible. Three backends
   // writing at once make it routine. An id list has no such blind spot: it is
   // the database's own answer to "what is in the feed", from one snapshot.
+  //
+  // The ids come back as a single aggregated array rather than one row each.
+  // That is not cosmetic: returning them as rows made the driver allocate an
+  // object per message, and at 18 000 messages a read cost four seconds on a
+  // one-CPU backend that was also serving writes. One row of one array is
+  // parsed once.
   async feedKeys(roomId, limit) {
     if (limit <= 0) return [];
     const res = await pool.query(
       {
         name: 'msg_feed_keys',
-        text: `select id, ts from (
+        text: `select array_agg(id order by ts asc, id asc) as ids from (
            select id, ts from messages
            where room_id = $1 and unsent = false
            order by ts desc, id desc limit $2
-         ) t order by ts asc, id asc`,
+         ) t`,
       },
       [roomId, limit],
     );
-    return res.rows.map((r) => ({ id: r.id, ts: Number(r.ts) }));
+    return (res.rows[0] && res.rows[0].ids) || [];
   }
 
   // Full messages for a set of ids, decrypted. The feed uses it to fill in only

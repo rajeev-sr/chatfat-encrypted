@@ -17,7 +17,8 @@
     "test:atrest": "node test/atrest.js",
     "test:signing": "node test/signing.js",
     "test:pg": "node test/postgres.js",
-    "test:all": "node test/protocol.js && node test/auth.js && node test/persistence.js && node test/crypto.js && node test/atrest.js && node test/signing.js && node test/postgres.js",
+    "test:feed": "node test/feed.js",
+    "test:all": "node test/protocol.js && node test/auth.js && node test/persistence.js && node test/crypto.js && node test/atrest.js && node test/signing.js && node test/postgres.js && node test/feed.js",
     "loadtest": "node tools/loadtest.js",
     "tamper": "node tools/tamper.js"
   },

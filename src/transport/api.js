@@ -298,7 +298,7 @@ const OPEN_BRACKET = Buffer.from('[');
 const CLOSE_BRACKET = Buffer.from(']');
 const COMMA = Buffer.from(',');
 
-const feedIndex = new Map(); // id -> { ts, json: string }
+const feedIndex = new Map(); // message id -> the JSON text of that message
 // { limit, n, ids, body, offsets, serialised, dbCount, dbMaxTs }
 let feedBody = null;
 
@@ -314,7 +314,7 @@ function indexWritten(entries, inserted) {
     const m = e.message;
     if (created && !created.has(m.id)) continue;
     if (feedIndex.has(m.id)) continue;
-    feedIndex.set(m.id, { ts: m.ts, json: JSON.stringify(toWire(m)) });
+    feedIndex.set(m.id, JSON.stringify(toWire(m)));
   }
   // The assembled body no longer reflects the index; the next read notices via
   // the fingerprint and extends it.
@@ -367,7 +367,7 @@ function assembleFeed(keys, limit, prev) {
   let shared = 0;
   if (prev && prev.limit === limit) {
     const max = Math.min(prev.n, keys.length);
-    while (shared < max && prev.ids[shared] === keys[shared].id) shared++;
+    while (shared < max && prev.ids[shared] === keys[shared]) shared++;
   }
 
   // Identical to what we already hold.
@@ -392,16 +392,15 @@ function assembleFeed(keys, limit, prev) {
   const ids = new Array(keys.length);
   for (let i = 0; i < shared; i++) ids[i] = prev.ids[i];
   for (let i = shared; i < keys.length; i++) {
-    const frag = feedIndex.get(keys[i].id);
     if (i > 0) {
       parts.push(COMMA);
       len += 1;
     }
     offsets.push(len);
-    const buf = Buffer.from(frag.json);
+    const buf = Buffer.from(feedIndex.get(keys[i]));
     parts.push(buf);
     len += buf.length;
-    ids[i] = keys[i].id;
+    ids[i] = keys[i];
   }
   parts.push(CLOSE_BRACKET);
 
@@ -514,7 +513,7 @@ async function resolveFeed(roomId, limit) {
   // Fill in only what this backend has never seen. Steady state is a handful of
   // messages per read; the first read after a restart is the whole table, once.
   const missing = [];
-  for (const k of keys) if (!feedIndex.has(k.id)) missing.push(k.id);
+  for (const id of keys) if (!feedIndex.has(id)) missing.push(id);
   if (missing.length) {
     // Chunked, and deliberately in small chunks. Decrypting a chunk is
     // synchronous, so the chunk size is how long the event loop is blocked at
@@ -524,13 +523,13 @@ async function resolveFeed(roomId, limit) {
     const CHUNK = 1000;
     for (let i = 0; i < missing.length; i += CHUNK) {
       const rows = await repository.byIds(roomId, missing.slice(i, i + CHUNK));
-      for (const m of rows) feedIndex.set(m.id, { ts: m.ts, json: JSON.stringify(toWire(m)) });
+      for (const m of rows) feedIndex.set(m.id, JSON.stringify(toWire(m)));
     }
   }
 
   // A key whose row vanished between the two reads has no fragment; drop it
   // rather than serialise a hole. The next read picks up the new truth.
-  const usable = keys.filter((k) => feedIndex.has(k.id));
+  const usable = keys.filter((id) => feedIndex.has(id));
 
   const { entry, reused } = assembleFeed(usable, limit, feedBody);
   entry.dbCount = fp ? fp.count : usable.length;
