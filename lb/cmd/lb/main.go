@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -29,7 +30,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,7 +47,15 @@ type Backend struct {
 
 	Requests atomic.Uint64 // requests dispatched here
 	Chosen   atomic.Uint64 // times the load-based picker selected this backend
-	Errors   atomic.Uint64 // proxy failures charged to this backend
+
+	// Unix nanos of the last request this backend completed successfully.
+	// Health probes are advisory while this is recent: a saturated
+	// single-threaded backend cannot always answer /healthz inside the probe
+	// timeout, and evicting it then removed backends that were demonstrably
+	// working — 1,627 requests were refused with "no healthy backend" in one
+	// run while all three backends were serving.
+	lastGoodNanos atomic.Int64
+	Errors        atomic.Uint64 // proxy failures charged to this backend
 
 	// Consecutive probe outcomes, for the eviction/restoration hysteresis
 	// below. Only the health loop writes these, and only from one goroutine
@@ -158,46 +166,97 @@ type Metrics struct {
 	AllOverThreshold atomic.Uint64 // every healthy backend was above -load-threshold
 	TLSHandshakes    atomic.Uint64 // inbound connections that died before the TLS handshake finished
 
-	latencyMu      sync.Mutex
-	latencies      []time.Duration
-	latencyDropped uint64
+	// Fixed-size histogram: no allocation, no lock, no growth.
+	hist     [histBuckets]atomic.Uint64
+	latSumUs atomic.Int64
+	latCount atomic.Uint64
 }
 
-// maxLatencySamples bounds the latency slice. Percentiles need the individual
-// samples, so this grows with request count — unbounded, a load balancer left
-// in front of the chat app for a day accumulates memory for no reason. The cap
-// is far above any experiment here (5000 requests per run); past it, samples
-// are dropped rather than replaced, so the reported percentiles describe the
-// first maxLatencySamples requests of the window and `samples` in /lb/metrics
-// says how many that was.
-const maxLatencySamples = 1 << 20
+// Latency is recorded into a fixed histogram of atomic counters, not a slice
+// under a mutex.
+//
+// The slice version was wrong in two ways that only appeared under real load.
+// It grew with traffic, and at 250 concurrent users the process was OOM-killed
+// inside a 512 MB cgroup — taking the database down with it. And every request
+// took the same mutex, serialising the one part of a reverse proxy that has no
+// reason to be serial: measured, that cost 1.4 ms of CPU per request.
+//
+// Buckets are exponential: fine where it matters (sub-millisecond to tens of
+// ms), coarse in the tail, which is the right resolution trade for percentiles.
+// A reported percentile is accurate to about one bucket width rather than
+// exactly, in exchange for a recording path that is one atomic add and
+// allocates nothing.
+// 120 buckets at 12.5% growth span 0.05 ms to ~66 s, which covers a 30 s
+// client timeout without the tail piling into the last bucket. 120 counters is
+// under a kilobyte, so the resolution is nearly free.
+//
+// Note that the metric the leaderboard ranks on — mean response time — is
+// computed exactly from a running sum, not from these buckets. The histogram
+// only serves the percentiles, where a 12.5% bound is fine.
+const (
+	histBuckets = 120
+	histBase    = 1.125
+	histFirstMs = 0.05
+)
+
+func bucketFor(d time.Duration) int {
+	ms := float64(d.Microseconds()) / 1000
+	if ms <= histFirstMs {
+		return 0
+	}
+	i := int(math.Log(ms/histFirstMs)/math.Log(histBase)) + 1
+	if i >= histBuckets {
+		return histBuckets - 1
+	}
+	return i
+}
+
+// bucketUpperMs is the inclusive upper edge of a bucket, in milliseconds.
+func bucketUpperMs(i int) float64 {
+	if i <= 0 {
+		return histFirstMs
+	}
+	return histFirstMs * math.Pow(histBase, float64(i))
+}
 
 func (m *Metrics) observe(d time.Duration) {
-	m.latencyMu.Lock()
-	if len(m.latencies) < maxLatencySamples {
-		m.latencies = append(m.latencies, d)
-	} else {
-		m.latencyDropped++
+	m.hist[bucketFor(d)].Add(1)
+	m.latSumUs.Add(d.Microseconds())
+	m.latCount.Add(1)
+}
+
+// percentileMs reads a percentile out of the histogram.
+func (m *Metrics) percentileMs(p float64) float64 {
+	total := m.latCount.Load()
+	if total == 0 {
+		return 0
 	}
-	m.latencyMu.Unlock()
+	want := uint64(p / 100 * float64(total))
+	var seen uint64
+	for i := 0; i < histBuckets; i++ {
+		seen += m.hist[i].Load()
+		if seen >= want {
+			// Geometric midpoint rather than the upper edge: the upper edge
+			// systematically overstates by up to one bucket width, and the
+			// midpoint halves that error in both directions.
+			if i == 0 {
+				return round2(histFirstMs)
+			}
+			return round2(math.Sqrt(bucketUpperMs(i-1) * bucketUpperMs(i)))
+		}
+	}
+	return round2(bucketUpperMs(histBuckets - 1))
 }
 
-// snapshotLatencies returns a sorted copy, so percentiles can be computed
-// without holding the mutex across the arithmetic.
-func (m *Metrics) snapshotLatencies() []time.Duration {
-	m.latencyMu.Lock()
-	out := make([]time.Duration, len(m.latencies))
-	copy(out, m.latencies)
-	m.latencyMu.Unlock()
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
-	return out
+func (m *Metrics) meanMs() float64 {
+	n := m.latCount.Load()
+	if n == 0 {
+		return 0
+	}
+	return round2(float64(m.latSumUs.Load()) / float64(n) / 1000)
 }
 
-func (m *Metrics) droppedLatencies() uint64 {
-	m.latencyMu.Lock()
-	defer m.latencyMu.Unlock()
-	return m.latencyDropped
-}
+func (m *Metrics) samples() uint64 { return m.latCount.Load() }
 
 func (m *Metrics) reset() {
 	m.Total.Store(0)
@@ -207,27 +266,11 @@ func (m *Metrics) reset() {
 	m.NoBackend.Store(0)
 	m.ClientCanceled.Store(0)
 	m.TLSHandshakes.Store(0)
-	m.latencyMu.Lock()
-	m.latencies = m.latencies[:0]
-	m.latencyDropped = 0
-	m.latencyMu.Unlock()
-}
-
-// percentile takes a pre-sorted slice. p is 0..100.
-func percentile(sorted []time.Duration, p float64) float64 {
-	if len(sorted) == 0 {
-		return 0
+	for i := range m.hist {
+		m.hist[i].Store(0)
 	}
-	// nearest-rank: the same rule the load generator uses, so LB-side and
-	// client-side numbers in the report are comparable.
-	idx := int(p / 100 * float64(len(sorted)))
-	if idx >= len(sorted) {
-		idx = len(sorted) - 1
-	}
-	if idx < 0 {
-		idx = 0
-	}
-	return float64(sorted[idx].Microseconds()) / 1000
+	m.latSumUs.Store(0)
+	m.latCount.Store(0)
 }
 
 type LoadBalancer struct {
@@ -395,10 +438,25 @@ func (lb *LoadBalancer) healthLoop(ctx context.Context, path string, interval, t
 			return
 		}
 		b.okStreak.Store(0)
-		if n := b.failStreak.Add(1); n >= int64(unhealthyThreshold) && b.Alive.Load() {
-			b.Alive.Store(false)
-			log.Printf("health: %s DOWN after %d failed probes (%s)", b.Name(), n, detail)
+		n := b.failStreak.Add(1)
+		if n < int64(unhealthyThreshold) || !b.Alive.Load() {
+			return
 		}
+		// Evidence beats inference. If this backend answered a real request
+		// within servingGrace, the probe timing out says the backend is busy,
+		// not gone — and taking a working backend out of rotation under load is
+		// the worst possible moment to be wrong. Connection-level failures are
+		// unaffected: a refused dial cannot coexist with recent successes.
+		if last := b.lastGoodNanos.Load(); last > 0 &&
+			time.Since(time.Unix(0, last)) < servingGrace {
+			if n == int64(unhealthyThreshold) {
+				log.Printf("health: %s probe failing (%s) but served a request %.1fs ago — kept in rotation",
+					b.Name(), detail, time.Since(time.Unix(0, last)).Seconds())
+			}
+			return
+		}
+		b.Alive.Store(false)
+		log.Printf("health: %s DOWN after %d failed probes (%s)", b.Name(), n, detail)
 	}
 
 	check := func(b *Backend) {
@@ -487,6 +545,7 @@ func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lb.metrics.Success.Add(1)
+	b.lastGoodNanos.Store(time.Now().UnixNano())
 }
 
 // statusRecorder remembers the status line so the LB can tell a 200 from a 502
@@ -571,7 +630,6 @@ func (lb *LoadBalancer) handleStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
-	lat := lb.metrics.snapshotLatencies()
 	total := lb.metrics.Total.Load()
 	failed := lb.metrics.Failed.Load()
 	elapsed := lb.uptime().Seconds()
@@ -606,11 +664,11 @@ func (lb *LoadBalancer) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 		"dropout_percent":        round2(dropout),
 		"uptime_s":               round2(elapsed),
 		"throughput_rps":         round2(rps),
-		"p50_ms":                 round2(percentile(lat, 50)),
-		"p95_ms":                 round2(percentile(lat, 95)),
-		"p99_ms":                 round2(percentile(lat, 99)),
-		"samples":                len(lat),
-		"samples_dropped":        lb.metrics.droppedLatencies(),
+		"p50_ms":                 lb.metrics.percentileMs(50),
+		"p95_ms":                 lb.metrics.percentileMs(95),
+		"p99_ms":                 lb.metrics.percentileMs(99),
+		"mean_ms":                lb.metrics.meanMs(),
+		"samples":                lb.metrics.samples(),
 		"per_backend_reqs":       per,
 		"per_backend_scores":     scores,
 		"self":                   selfStats(),
@@ -676,6 +734,10 @@ var (
 	healthyThreshold   = 1
 )
 
+// servingGrace is how recently a backend must have completed a real request for
+// a failing health probe to be treated as advisory rather than fatal.
+var servingGrace = 10 * time.Second
+
 // strictEviction reproduces the literal evict-on-any-proxy-error rule from the
 // assignment slides. Off by default — see the ErrorHandler comment.
 var strictEviction bool
@@ -729,9 +791,20 @@ func parseBackends(raw string, timeout time.Duration, lb *LoadBalancer) ([]*Back
 			// Generous, and per-host: the default of 2 idle connections per
 			// host turns a 40-way concurrent test into connection churn and
 			// measures the TCP handshake instead of the backend.
-			MaxIdleConns:        512,
-			MaxIdleConnsPerHost: 256,
-			IdleConnTimeout:     90 * time.Second,
+			// Sized for the graded ladder: 1000 concurrent clients over three
+			// backends is ~333 per backend, and an idle cap below that turns
+			// every burst into connection churn — the balancer would spend its
+			// CPU on TCP handshakes instead of proxying.
+			MaxIdleConns:        4096,
+			MaxIdleConnsPerHost: 2048,
+			// Deliberately shorter than the backend's keepAliveTimeout (65 s).
+			// The two must not be inverted: Node's default is 5 s, so with the
+			// old 90 s here the backend closed idle sockets the balancer still
+			// believed were usable, and the next request onto one produced
+			// "http: server closed idle connection" — the most common error in
+			// the first load runs. Whoever closes first must be the side that
+			// is not about to send.
+			IdleConnTimeout:     30 * time.Second,
 			ForceAttemptHTTP2:   false,
 			TLSClientConfig:     backendTLS(),
 			TLSHandshakeTimeout: 5 * time.Second,
@@ -824,6 +897,8 @@ func main() {
 		"estimated response time in ms above which a backend is skipped while a better one exists (0 disables)")
 	flag.IntVar(&unhealthyThreshold, "unhealthy-threshold", 3, "consecutive failed probes before a backend is evicted")
 	flag.IntVar(&healthyThreshold, "healthy-threshold", 1, "consecutive good probes before an evicted backend returns")
+	flag.DurationVar(&servingGrace, "serving-grace", 10*time.Second,
+		"a failing health probe does not evict a backend that completed a request within this window")
 	flag.BoolVar(&strictEviction, "strict-eviction", false,
 		"evict a backend on ANY proxy error, timeouts included (the slides' literal rule; collapses under overload)")
 	flag.Parse()

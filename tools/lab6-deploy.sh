@@ -28,7 +28,9 @@ REPO_DIR=chatfat-encrypted
 # bridge, which Docker drops.
 BRIDGE=(x 172.17.0.74 172.17.0.75 172.17.0.76 172.17.0.77)
 APP_PORT=3000        # what the host publishes as 3273-3276
-LB_PUBLIC="https://$HOST:3273"
+# Scheme follows LB_TLS, so the verification steps below test what is actually
+# being served rather than what was served last time.
+if [ "${LB_TLS:-0}" = "1" ]; then LB_PUBLIC="https://$HOST:3273"; else LB_PUBLIC="http://$HOST:3273"; fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$ROOT/tools/lab6.env"
@@ -77,6 +79,15 @@ source "$ENV_FILE"
 DB_POOL_MAX="${DB_POOL_MAX:-40}"
 STRATEGY="${STRATEGY:-p2c}"
 LOAD_THRESHOLD="${LOAD_THRESHOLD:-50}"
+# Plain HTTP by default. The grading client speaks http:// — a TLS listener
+# answers a plaintext request with 400 and rejects an unverified HTTPS one, so
+# an HTTPS-only endpoint fails whichever way the client connects. TLS also cost
+# CPU on the one core Sys1 has. Set LB_TLS=1 to serve HTTPS instead.
+LB_TLS="${LB_TLS:-0}"
+# Soft limit, raised from the container default of 1024 towards the 524288 hard
+# limit. At 1000 concurrent clients the balancer alone needs ~1000 inbound plus
+# ~1000 outbound sockets; the default produced "dial tcp: i/o timeout".
+FD_LIMIT="${FD_LIMIT:-65536}"
 
 # Two checks, and the second one is the one that matters.
 #
@@ -108,24 +119,49 @@ fi
 ok "origin/$BRANCH is $(git -C "$ROOT" rev-parse --short HEAD)"
 
 say "1/4  pulling on all four systems"
+WANT=$(git -C "$ROOT" rev-parse HEAD)
+PULL_FAILED=0
 for n in 1 2 3 4; do
-  ssh_sys "$n" "
-    set -e
-    cd ~/$REPO_DIR
-    git fetch --quiet origin $BRANCH
-    git checkout --quiet -B $BRANCH origin/$BRANCH
-    # Hard reset, not merge: see the header. bin/ is excluded from the clean so
-    # a compiled binary is not deleted out from under a running process.
-    git reset --hard --quiet origin/$BRANCH
-    git clean -qfd -e bin -e node_modules
-    echo \"  sys$n now at \$(git rev-parse --short HEAD)\"" 2>&1 | tail -1
+  # -f on the checkout, and BEFORE any reset: a plain `git checkout -B` refuses
+  # to overwrite locally modified tracked files and aborts, which is exactly
+  # what a lab box that has been touched by hand will have. Discarding is the
+  # intent here — the remote branch is the only thing that should be running.
+  got=$(ssh_sys "$n" "
+    cd ~/$REPO_DIR || exit 91
+    git fetch --quiet origin $BRANCH || exit 92
+    git checkout -qf -B $BRANCH origin/$BRANCH || exit 93
+    git reset --hard --quiet origin/$BRANCH || exit 94
+    # bin/ is excluded so a compiled binary is not deleted out from under a
+    # running process; node_modules so deps are not reinstalled every deploy.
+    git clean -qfd -e bin -e node_modules || exit 95
+    git rev-parse HEAD" 2>/dev/null | tail -1)
+
+  # Verified, not assumed. The previous version of this script continued after
+  # every pull had failed and then reported the new commit as deployed, which
+  # is worse than failing: it hands over a stale deployment with a clean bill
+  # of health.
+  if [ "$got" = "$WANT" ]; then
+    ok "sys$n at $(echo "$got" | cut -c1-7)"
+  else
+    bad "sys$n is at '${got:-<no answer>}', wanted $(echo "$WANT" | cut -c1-7)"
+    PULL_FAILED=1
+  fi
 done
+if [ "$PULL_FAILED" -ne 0 ]; then
+  bad "at least one system is not on the requested commit — refusing to continue"
+  bad "nothing has been restarted; the previous deployment is still running"
+  exit 1
+fi
 
 say "2/4  dependencies"
 for n in 2 3 4; do
   ssh_sys "$n" "cd ~/$REPO_DIR && (npm install --omit=dev --silent >/dev/null 2>&1 || npm install --silent >/dev/null 2>&1); node -e 'require(\"ws\")' 2>/dev/null && echo '  sys$n deps ok' || echo '  sys$n deps MISSING'" 2>&1 | tail -1
 done
-ssh_sys 1 "cd ~/$REPO_DIR && export PATH=\$HOME/goroot/bin:\$PATH && go build -C lb -o ../bin/lb ./cmd/lb && echo '  sys1 load balancer built'" 2>&1 | tail -1
+if ! ssh_sys 1 "cd ~/$REPO_DIR && export PATH=\$HOME/goroot/bin:\$PATH && go build -C lb -o ../bin/lb ./cmd/lb" 2>&1 | tail -3; then
+  bad "the load balancer did not build on sys1 — refusing to continue"
+  exit 1
+fi
+ok "sys1 load balancer built"
 
 say "3/4  starting backends (container port $APP_PORT -> public 3274-3276)"
 for n in 2 3 4; do
@@ -133,7 +169,7 @@ for n in 2 3 4; do
   ssh_sys "$n" "
     tmux kill-session -t backend 2>/dev/null
     tmux new -d -s backend
-    tmux send-keys -t backend 'cd ~/$REPO_DIR && PORT=$APP_PORT BACKEND_NAME=$name \
+    tmux send-keys -t backend 'ulimit -n $FD_LIMIT; cd ~/$REPO_DIR && PORT=$APP_PORT BACKEND_NAME=$name \
       DATABASE_URL=\"$DATABASE_URL\" MASTER_KEY=\"$MASTER_KEY\" DB_POOL_MAX=$DB_POOL_MAX \
       BENCH_ENABLED=1 TLS_CERT_FILE= TLS_KEY_FILE= node server.js' C-m
     sleep 6" >/dev/null 2>&1
@@ -146,14 +182,18 @@ done
 
 say "4/4  starting the load balancer on sys1"
 BACKENDS="http://${BRIDGE[2]}:$APP_PORT,http://${BRIDGE[3]}:$APP_PORT,http://${BRIDGE[4]}:$APP_PORT"
+TLS_ARGS=""
+if [ "$LB_TLS" = "1" ]; then
+  TLS_ARGS="-tls-cert ./tls-cert.pem -tls-key ./tls-key.pem"
+  warn "serving HTTPS — the grading client uses http://, so this will fail its tests"
+fi
 ssh_sys 1 "
   tmux kill-session -t lb 2>/dev/null
   tmux new -d -s lb
-  tmux send-keys -t lb 'cd ~/$REPO_DIR && ./bin/lb -listen 0.0.0.0:$APP_PORT \
+  tmux send-keys -t lb 'ulimit -n $FD_LIMIT; cd ~/$REPO_DIR && ./bin/lb -listen 0.0.0.0:$APP_PORT \
     -backends $BACKENDS \
     -strategy $STRATEGY -load-threshold $LOAD_THRESHOLD \
-    -health-timeout 5s -backend-timeout 15s \
-    -tls-cert ./tls-cert.pem -tls-key ./tls-key.pem' C-m
+    -health-timeout 5s -backend-timeout 15s $TLS_ARGS' C-m
   sleep 5" >/dev/null 2>&1
 
 if st=$(curl -sk -m 10 "$LB_PUBLIC/lb/status" 2>/dev/null); then

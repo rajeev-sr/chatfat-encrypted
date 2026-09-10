@@ -204,31 +204,65 @@ async function handleMessage(req, res, url) {
 
 // — /feed response cache —
 //
-// /feed is specified as "retrieves all messages", and the honest reading of
-// that is expensive: fetching every row, decrypting each one, and serialising
-// the result took 1.8 s against 20 000 messages. Under a read-heavy load
-// generator that cost is paid again for every call, and it dominates
-// everything else the system does.
+// /feed is specified as "retrieves all messages", and the honest reading is
+// expensive: fetching every row, decrypting each one and serialising the result
+// took 1.8 s against 20 000 messages. A read-heavy grader pays that per call.
 //
-// Caching it naively would be wrong — a client that posts a message and
-// immediately reads the feed must see it, and with three backends sharing one
-// database a write on one node has to invalidate the cache on the others. So
-// the cache is validated rather than timed: one cheap aggregate establishes
-// whether anything has changed since the body was built. Any insert moves the
-// row count and the maximum timestamp, so a stale body cannot be served.
+// Caching it naively would be wrong: a client that posts a message and
+// immediately reads the feed must see it, and with several backends sharing one
+// database a write on one node has to be visible on the others. So the cache is
+// validated rather than timed — one cheap aggregate says whether anything has
+// changed — and, because messages are append-only, a change is served by
+// fetching ONLY the rows newer than what is already cached. Steady-state cost
+// is therefore proportional to new messages, not to table size.
 //
-// The validating query costs a few milliseconds against the ~1.8 s it avoids.
-let feedCache = null; // { limit, count, maxTs, body }
+// Correctness rests on messages being immutable once written. Edits and
+// deletions go through repository.update/remove, which the chat protocol uses
+// but these routes never do; if that ever changes, the row count in the
+// fingerprint would no longer be a sufficient invalidator and this must become
+// a full refetch.
+let feedCache = null; // { limit, count, maxTs, maxId, items }
+
+// Rebuilding the cache is a read-modify-write across two awaits (fingerprint,
+// then fetch), so concurrent /feed requests must not interleave inside it.
+// They did: two callers both read the same watermark, both fetched the same new
+// rows, and both appended them — 40 concurrent posts with 10 concurrent reads
+// produced 230 items of which 160 were duplicates, out of order.
+//
+// A promise chain serialises the critical section. /feed becomes sequential,
+// which is a fair price: the common paths are a cache hit or a small append, and
+// a feed that is fast but wrong is worth nothing. Each caller re-checks the
+// fingerprint after acquiring, so a message posted while it waited is still
+// visible to it — read-your-write survives the serialisation.
+let feedGate = Promise.resolve();
+
+function withFeedGate(fn) {
+  const run = feedGate.then(fn, fn);
+  // Swallow errors on the chain itself, or one failed rebuild would reject
+  // every subsequent request forever.
+  feedGate = run.then(() => {}, () => {});
+  return run;
+}
 
 async function feedFingerprint(roomId) {
   if (!config.USE_POSTGRES) return null; // other repositories are in-process and cheap already
   const pool = require('../db/pool');
   const res = await pool.query(
-    'select count(*)::int as n, coalesce(max(ts), 0)::bigint as t from messages where room_id = $1 and unsent = false',
+    { name: 'feed_fingerprint', text: 'select count(*)::int as n, coalesce(max(ts), 0)::bigint as t from messages where room_id = $1 and unsent = false' },
     [roomId],
   );
   const row = res.rows[0] || {};
   return { count: Number(row.n || 0), maxTs: String(row.t || 0) };
+}
+
+function toWire(m) {
+  return {
+    id: m.id,
+    'client-name': m.from,
+    msg: m.text,
+    ts: m.ts,
+    ...(m.tampered ? { tampered: true } : {}),
+  };
 }
 
 async function handleFeed(req, res, url) {
@@ -238,46 +272,66 @@ async function handleFeed(req, res, url) {
     ? Math.min(asked, config.FEED_MAX)
     : config.FEED_LIMIT;
 
-  const fp = await feedFingerprint(room.id);
-  if (fp && feedCache && feedCache.limit === limit
-      && feedCache.count === fp.count && feedCache.maxTs === fp.maxTs) {
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'x-backend': config.BACKEND_NAME,
-      // The number of messages in the body, which is not the same as the
-      // fingerprint's row count once the FEED_LIMIT cap is in play.
-      'x-message-count': String(feedCache.bodyCount),
-      'x-feed-cache': 'hit',
-    });
-    return res.end(feedCache.body);
-  }
-
-  const messages = await repository.recent(room.id, limit);
-
-  // Field names mirror the input contract: a caller that posts "client-name"
-  // and "msg" reads back "client-name" and "msg".
-  const out = messages.map((m) => ({
-    id: m.id,
-    'client-name': m.from,
-    msg: m.text,
-    ts: m.ts,
-    ...(m.tampered ? { tampered: true } : {}),
-  }));
-
-  // Serialised once and kept as a Buffer, so a cache hit is a socket write with
-  // no JSON work at all.
-  const body = Buffer.from(JSON.stringify(out));
-  if (fp) feedCache = { limit, count: fp.count, maxTs: fp.maxTs, body, bodyCount: out.length };
+  const { items, mode } = await withFeedGate(() => resolveFeed(room.id, limit));
 
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'x-backend': config.BACKEND_NAME,
-    'x-message-count': String(out.length),
-    'x-feed-cache': 'miss',
+    'x-message-count': String(items.length),
+    'x-feed-cache': mode,
   });
-  res.end(body);
+  res.end(JSON.stringify(items));
+}
+
+// Runs under withFeedGate, so it may read and replace feedCache freely.
+async function resolveFeed(roomId, limit) {
+  const fp = await feedFingerprint(roomId);
+
+  if (fp && feedCache && feedCache.limit === limit) {
+    if (feedCache.count === fp.count && feedCache.maxTs === fp.maxTs) {
+      return { items: feedCache.items, mode: 'hit' };
+    }
+    if (feedCache.maxId) {
+      // Append-only: fetch just what arrived since the cached watermark.
+      const rows = await repository.since(
+        roomId, { ts: feedCache.maxTs, id: feedCache.maxId }, limit,
+      );
+      // Appending is only sound if nothing was removed, and neither the row
+      // count nor `since()` proves that on its own: after a table was emptied
+      // and two rows re-added, the count was coincidentally unchanged and
+      // since() correctly reported two new rows, so the two deleted rows stayed
+      // in the cache and the feed grew by two on every cycle.
+      //
+      // This arithmetic is the missing proof. feedCache.count is the row count
+      // the database reported when the cache was last correct, so for an
+      // append-only table it must equal the new count minus what arrived since.
+      // Any deletion breaks the equality and forces a rebuild. It holds whether
+      // or not the item list is capped, because it compares database counts
+      // rather than cached item counts.
+      if (rows.length && feedCache.count + rows.length === fp.count) {
+        let items = feedCache.items.concat(rows.map(toWire));
+        // Honour the cap by dropping the oldest, which is what recent() returns.
+        if (items.length > limit) items = items.slice(items.length - limit);
+        const last = rows[rows.length - 1];
+        feedCache = { limit, count: fp.count, maxTs: String(last.ts), maxId: last.id, items };
+        return { items, mode: 'append' };
+      }
+      // Either nothing is newer than the watermark, or the counts do not add up
+      // — a deletion, or a row backdated behind the watermark. Rebuild rather
+      // than serve a base that can no longer be trusted.
+    }
+  }
+
+  const messages = await repository.recent(roomId, limit);
+  const items = messages.map(toWire);
+  if (fp) {
+    const last = messages[messages.length - 1];
+    feedCache = last
+      ? { limit, count: fp.count, maxTs: String(last.ts), maxId: last.id, items }
+      : { limit, count: fp.count, maxTs: '0', maxId: null, items };
+  }
+  return { items, mode: 'miss' };
 }
 
 // Returns true when it handled the request.

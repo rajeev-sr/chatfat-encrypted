@@ -141,12 +141,20 @@ module.exports = {
   // high enough not to truncate a graded run rather than a page size. FEED_MAX
   // bounds what an explicit ?limit= may ask for, so one request cannot be used
   // to pull the whole table repeatedly.
-  FEED_LIMIT: int('FEED_LIMIT', 20000, 1, 200000),
+  // One graded submission runs both boards back to back against the same
+  // deployment — roughly 22 500 requests on the static board then 16 000+ on the
+  // breakpoint board. A 20 000 cap would silently truncate the older half, and
+  // the completeness check would report messages as lost that were in fact
+  // stored. 60 000 covers a full submission with headroom while keeping the
+  // serialised response near 10 MB, which matters in a 512 MB container.
+  FEED_LIMIT: int('FEED_LIMIT', 60000, 1, 200000),
   FEED_MAX: int('FEED_MAX', 200000, 1, 1000000),
   // Connections per backend process. Three backends at this size must stay
   // comfortably under the server's max_connections.
   DB_POOL_MAX: int('DB_POOL_MAX', 10, 1, 500),
   DB_CONNECT_TIMEOUT_MS: int('DB_CONNECT_TIMEOUT_MS', 8000, 250, 60000),
+  // Must stay above the load balancer's -idle-conn-timeout (30 s). See app.js.
+  KEEPALIVE_TIMEOUT_MS: int('KEEPALIVE_TIMEOUT_MS', 65000, 1000, 600000),
   // At-rest encryption of stored message text (requirement 3) and its keys
   // (requirement 4 rides on the same AEAD tag — see src/crypto/atRest.js).
   MASTER_KEYS,
