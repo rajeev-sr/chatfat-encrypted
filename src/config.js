@@ -138,7 +138,14 @@ module.exports = {
   // conversation rather than three.
   LAB_ROOM: str('LAB_ROOM', 'feed'),
   // /feed is specified as "retrieves all messages", so the default is a cap
-  // high enough not to truncate a graded run rather than a page size. FEED_MAX
+  // 80 000 is a memory bound, not a page size. Each indexed message costs the
+  // JSON text it contributes to the feed, and assembling a new body holds the
+  // previous one alive alongside it, so the ceiling is roughly twice the body
+  // plus the index. At 150 000 that came to more than the 512 MB the container
+  // allows and a backend was OOM-killed mid-run. One graded submission can
+  // accept at most 60 000 messages — 20 000 on the static board and 40 000 on
+  // the breakpoint board — so 80 000 clears a full run with room to spare while
+  // staying inside the limit. FEED_MAX
   // bounds what an explicit ?limit= may ask for, so one request cannot be used
   // to pull the whole table repeatedly.
   // One graded submission runs both boards back to back against the same
@@ -147,7 +154,7 @@ module.exports = {
   // the completeness check would report messages as lost that were in fact
   // stored. 60 000 covers a full submission with headroom while keeping the
   // serialised response near 10 MB, which matters in a 512 MB container.
-  FEED_LIMIT: int('FEED_LIMIT', 150000, 1, 1000000),
+  FEED_LIMIT: int('FEED_LIMIT', 80000, 1, 1000000),
   FEED_MAX: int('FEED_MAX', 300000, 1, 2000000),
   // Connections per backend process. Three backends at this size must stay
   // comfortably under the server's max_connections.

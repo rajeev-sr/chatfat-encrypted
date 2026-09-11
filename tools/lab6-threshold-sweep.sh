@@ -43,7 +43,7 @@ restart_lb() {
     tmux send-keys -t lb 'ulimit -n 65536; cd ~/chatfat-encrypted && ./bin/lb -listen 0.0.0.0:3000 \
       -backends http://172.17.0.75:3000,http://172.17.0.76:3000,http://172.17.0.77:3000 \
       -strategy p2c -load-threshold $1 \
-      -health-timeout 5s -backend-timeout 45s' C-m
+      -health-timeout 5s -backend-timeout 180s' C-m
     sleep 4" >/dev/null 2>&1
   curl -sk -m 8 "$LB_PUB/lb/status" >/dev/null 2>&1
 }

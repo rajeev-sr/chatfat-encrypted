@@ -821,6 +821,21 @@ func parseBackends(raw string, timeout time.Duration, lb *LoadBalancer) ([]*Back
 		b.Alive.Store(true)
 
 		p := httputil.NewSingleHostReverseProxy(u)
+		// Keep content negotiation the client's. Go's transport adds
+		// "Accept-Encoding: gzip" to any request that does not already carry
+		// one and then transparently decompresses the reply. Through a proxy
+		// that is pure waste in both directions: the backend spends CPU
+		// compressing a feed nobody asked to have compressed, and this process
+		// spends more CPU throwing that work away. Asking for identity when the
+		// client stayed silent leaves a client that did ask for gzip to be
+		// answered with gzip, end to end.
+		director := p.Director
+		p.Director = func(r *http.Request) {
+			director(r)
+			if r.Header.Get("Accept-Encoding") == "" {
+				r.Header.Set("Accept-Encoding", "identity")
+			}
+		}
 		// Without a BufferPool, ReverseProxy allocates a fresh 32 KB buffer for
 		// every response body it copies. At a few hundred requests a second
 		// that is megabytes per second of garbage, and the collector's share of

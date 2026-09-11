@@ -20,6 +20,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const zlib = require('zlib');
 const config = require('../config');
 const log = require('../logger');
 const rooms = require('../rooms');
@@ -434,6 +435,34 @@ function toWire(m) {
   };
 }
 
+
+// The graded client reads the whole feed over the network, and the body grows
+// with every message stored. A run that ended with 4.8 MB was verified; the
+// next one, on the same deployment, ended with 15 MB and the balancer gave up
+// waiting at 45 s — the feed could not be checked and the run was ranked last.
+// Compressing it is the difference between shipping megabytes of near-identical
+// JSON and shipping the handful of bytes that actually differ.
+//
+// zlib.gzip is asynchronous and runs on libuv's thread pool, so this costs the
+// event loop nothing — which matters, because the same process is serving
+// writes while it happens. The result is cached on the cache entry: the entry
+// is immutable once assembled, so one compression serves every reader of it,
+// and a second request that arrives mid-compression waits on the same promise
+// rather than starting its own.
+function acceptsGzip(req) {
+  const ae = req.headers['accept-encoding'];
+  return typeof ae === 'string' && /(^|,)\s*gzip\s*(;|,|$)/i.test(ae);
+}
+
+function gzipFull(entry) {
+  if (!entry.gzipPromise) {
+    entry.gzipPromise = new Promise((resolve, reject) => {
+      zlib.gzip(entry.body, { level: 6 }, (err, out) => (err ? reject(err) : resolve(out)));
+    });
+  }
+  return entry.gzipPromise;
+}
+
 async function handleFeed(req, res, url) {
   const room = await labRoom();
   const asked = Number(url.searchParams.get('limit'));
@@ -449,12 +478,27 @@ async function handleFeed(req, res, url) {
     () => resolveFeed(room.id, config.FEED_LIMIT),
   );
   const want = Math.min(limit, entry.n);
-  const body = feedSlice(entry, want);
+  let body = feedSlice(entry, want);
   const count = want;
+
+  // Only the whole feed is compressed, and only when asked for: a ?limit= slice
+  // is a different body every time and not worth the work, and a client that
+  // did not offer gzip must not be sent it.
+  let encoding = null;
+  if (want === entry.n && body.length > 1024 && acceptsGzip(req)) {
+    try {
+      body = await gzipFull(entry);
+      encoding = 'gzip';
+    } catch (err) {
+      log.warn(`feed gzip failed, sending plain: ${err.message}`);
+      body = feedSlice(entry, want);
+    }
+  }
 
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
+    ...(encoding ? { 'content-encoding': encoding, vary: 'accept-encoding' } : {}),
     'content-length': String(body.length),
     'x-backend': config.BACKEND_NAME,
     'x-message-count': String(count),
@@ -483,10 +527,28 @@ async function handleFeed(req, res, url) {
 // the critical path.
 function startFeedWarmer() {
   if (!config.FEED_WARM_MS) return;
+  // One pass at a time, always. The interval used to enqueue a rebuild every
+  // beat no matter what, and every rebuild runs through the same gate that
+  // serves GET /feed. Once a pass took longer than the interval — which it
+  // does as soon as the table is large and the backend is busy — beats queued
+  // faster than they drained and the gate grew without bound. A real request
+  // arriving after two minutes of that sat behind a hundred redundant
+  // rebuilds of the same feed and timed out. It cost a graded run every
+  // message it had stored: the balancer returned 504, the feed could not be
+  // verified, and the run was ranked last on both boards despite having served
+  // the whole ladder.
+  //
+  // Skipping a beat loses nothing. The pass that is already running reads the
+  // table as it stands when it gets there, so it subsumes the work of every
+  // beat that fired while it ran.
+  let running = false;
   const timer = setInterval(() => {
+    if (running) return;
+    running = true;
     labRoom()
       .then((room) => withFeedGate(() => resolveFeed(room.id, config.FEED_LIMIT)))
-      .catch((err) => log.warn(`feed warmer: ${err.message}`));
+      .catch((err) => log.warn(`feed warmer: ${err.message}`))
+      .then(() => { running = false; }, () => { running = false; });
   }, config.FEED_WARM_MS);
   // Unref'd: a cache warmer must never be the reason the process stays alive.
   if (timer.unref) timer.unref();

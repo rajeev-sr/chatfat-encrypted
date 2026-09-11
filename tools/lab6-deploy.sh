@@ -193,7 +193,7 @@ ssh_sys 1 "
   tmux send-keys -t lb 'ulimit -n $FD_LIMIT; cd ~/$REPO_DIR && ./bin/lb -listen 0.0.0.0:$APP_PORT \
     -backends $BACKENDS \
     -strategy $STRATEGY -load-threshold $LOAD_THRESHOLD \
-    -health-timeout 5s -backend-timeout 45s $TLS_ARGS' C-m
+    -health-timeout 5s -backend-timeout 180s $TLS_ARGS' C-m
   sleep 5" >/dev/null 2>&1
 
 if st=$(curl -sk -m 10 "$LB_PUBLIC/lb/status" 2>/dev/null); then

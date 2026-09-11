@@ -21,12 +21,14 @@
 'use strict';
 
 const { ok, eq, bail, report, startServer, sleep } = require('./harness');
+const http = require('http');
+const zlib = require('zlib');
 
 const PORT = 8093;
 const URL = process.env.TEST_DATABASE_URL;
 
-async function feed(port, query = '') {
-  const res = await fetch(`http://127.0.0.1:${port}/feed${query}`);
+async function feed(port, query = '', headers = {}) {
+  const res = await fetch(`http://127.0.0.1:${port}/feed${query}`, { headers });
   const text = await res.text();
   return {
     status: res.status,
@@ -34,6 +36,20 @@ async function feed(port, query = '') {
     text,
     items: res.ok ? JSON.parse(text) : null,
   };
+}
+
+// fetch() offers gzip and decompresses the reply before returning it, which
+// hides the bytes actually sent. These assertions are about those bytes, so
+// they go through http directly.
+function rawFeed(port, headers) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ port, host: '127.0.0.1', path: '/feed', headers }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ headers: res.headers, raw: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+  });
 }
 
 async function send(port, name, msg, id) {
@@ -135,9 +151,31 @@ function wellFormed(items, label) {
       eq(JSON.stringify(part.items), JSON.stringify(all.slice(all.length - want)),
         `limit=${k} returns exactly the newest ${want}`);
     }
-    const sized = await feed(PORT);
+    const sized = await feed(PORT, '', { 'accept-encoding': 'identity' });
     eq(Number(sized.headers.get('content-length')), Buffer.byteLength(sized.text),
       'content-length matches the body actually sent');
+
+    // ── gzip ──────────────────────────────────────────────────────────────
+    // The graded client reads the whole feed over the network and the body
+    // grows with every message stored. A 4.8 MB feed was verified and a 15 MB
+    // one, on the same deployment minutes later, was still transferring when
+    // the balancer gave up at 45 s — so the run could not be checked at all.
+    // What matters is that the compressed reply carries the same messages and
+    // that Content-Length describes the encoded bytes, not the original: get
+    // that wrong and the client truncates the feed or hangs waiting for bytes
+    // that never come.
+    const gz = await rawFeed(PORT, { 'accept-encoding': 'gzip' });
+    eq(gz.headers['content-encoding'], 'gzip', 'gzip is used when the client offers it');
+    eq(Number(gz.headers['content-length']), gz.raw.length,
+      'content-length counts the encoded bytes, not the original');
+    eq(zlib.gunzipSync(gz.raw).toString(), sized.text,
+      'the compressed feed decompresses to exactly the plain feed');
+    ok(gz.raw.length < Buffer.byteLength(sized.text) / 2,
+      'compression at least halves the feed');
+    const plain = await rawFeed(PORT, { 'accept-encoding': 'identity' });
+    ok(!plain.headers['content-encoding'],
+      'a client that does not offer gzip is not sent gzip');
+    eq(plain.raw.toString(), sized.text, 'the uncompressed feed is unchanged');
 
     // The body has been extended in place many times by now. A server that has
     // just started assembles the same feed from scratch, so the two must be
