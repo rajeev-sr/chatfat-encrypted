@@ -146,7 +146,18 @@ async function start() {
   server.keepAliveTimeout = config.KEEPALIVE_TIMEOUT_MS;
   server.headersTimeout = config.KEEPALIVE_TIMEOUT_MS + 5000;
 
-  await new Promise((resolve) => server.listen(config.PORT, config.HOST, resolve));
+  // The third argument is the accept backlog, and leaving it out is not
+  // harmless: Node defaults to 511 while this kernel allows 4096. A ladder that
+  // ramps to 2500 concurrent clients opens connections far faster than a single
+  // thread accepts them, the queue overflows, and the kernel's answer to an
+  // overflow is to drop the SYN silently. The client then waits out a TCP
+  // retransmit — one second, then two, then four — so a request that would have
+  // taken 250 ms times out instead, and the loss is spread evenly across the
+  // run rather than clustered where the load is heaviest. One backend had
+  // logged 23 323 such drops.
+  await new Promise((resolve) => {
+    server.listen(config.PORT, config.HOST, config.LISTEN_BACKLOG, resolve);
+  });
 
   websocket.startHeartbeat();
   throttleSweep = setInterval(http.sweepThrottle, config.AUTH_WINDOW_MS);

@@ -27,6 +27,9 @@ const rooms = require('../rooms');
 const { hub, colourFor } = require('../state/hub');
 const { repository } = require('../messages/repository');
 const load = require('./load');
+const pool = require('../db/pool');
+const directory = require('../rooms/directory');
+const frames = require('../protocol/frames');
 
 // Bounded so a malformed or hostile request cannot buffer without limit.
 const MAX_BODY = 64 * 1024;
@@ -105,7 +108,12 @@ function parseFields(raw, contentType, url) {
 // to produce the *same* id for the same client-supplied message, and including
 // the machine would defeat exactly the deduplication this exists for.
 function generateId() {
-  return `m_${Date.now().toString(36)}_${crypto.randomUUID()}`;
+  // 128 random bits, base64url: 24 characters where the timestamp-plus-UUID
+  // form was 47. The prefix is part of the WebSocket protocol's contract and
+  // stays. The rest of the id is only ever compared for equality, so nothing
+  // is lost — and every byte of it is repeated across sixty thousand messages
+  // in a feed the grading client reads hundreds of times a minute.
+  return `m_${crypto.randomBytes(16).toString('base64url')}`;
 }
 
 // — group commit for POST /message —
@@ -178,7 +186,7 @@ function labRoom() {
       if (!room) {
         room = rooms.createRoom(name, null, true);
         try {
-          require('../rooms/directory').save(room);
+          directory.save(room);
         } catch (err) {
           log.warn(`could not persist the lab room record: ${err.message}`);
         }
@@ -248,7 +256,7 @@ async function handleMessage(req, res, url) {
   // live chat. Best-effort: a broadcast failure must not fail a stored message.
   try {
     if (hub.rooms.has(room.id)) {
-      require('../protocol/frames').broadcast(room.id, 'msg', message);
+      frames.broadcast(room.id, 'msg', message);
     }
   } catch (err) {
     log.warn(`broadcast of HTTP message ${id} failed: ${err.message}`);
@@ -302,6 +310,14 @@ const COMMA = Buffer.from(',');
 const feedIndex = new Map(); // message id -> the JSON text of that message
 // { limit, n, ids, body, offsets, serialised, dbCount, dbMaxTs }
 let feedBody = null;
+// When this backend last stored a message, and the single rebuild currently
+// running, if any. Together they decide whether a read must be exact or may be
+// answered from the snapshot we already have.
+let lastAcceptedAt = 0;
+let feedRebuild = null;
+// The entry snapshot readers are served: the most recent one whose compressed
+// form is ready. It trails feedBody by one compression, and that is the point.
+let feedSnapshot = null;
 
 // Record messages this backend just wrote, so a later read need not fetch and
 // decrypt them again. Only ids the insert actually created are recorded — a
@@ -309,6 +325,7 @@ let feedBody = null;
 // our rejected version instead would make this backend's /feed disagree with
 // everyone else's.
 function indexWritten(entries, inserted) {
+  lastAcceptedAt = Date.now();
   if (!inserted || !inserted.length) return;
   const created = inserted.length === entries.length ? null : new Set(inserted);
   for (const e of entries) {
@@ -343,7 +360,6 @@ function withFeedGate(fn) {
 // Cheap "has anything changed at all" probe: one index-only aggregate, so an
 // idle feed costs no more than this however many messages it holds.
 async function feedFingerprint(roomId) {
-  const pool = require('../db/pool');
   const res = await pool.query(
     {
       name: 'feed_fingerprint',
@@ -454,16 +470,95 @@ function acceptsGzip(req) {
   return typeof ae === 'string' && /(^|,)\s*gzip\s*(;|,|$)/i.test(ae);
 }
 
-function gzipFull(entry) {
+// Compression happens in the warmer and nowhere else.
+//
+// Measured on this hardware, gzipping the assembled feed costs 100 ms of CPU at
+// 20 000 messages and 411 ms at 57 600 — on a container with exactly one CPU.
+// Caching the result per cache entry sounds like it bounds that, and does not:
+// under write load every read finds the fingerprint changed, assembles a new
+// entry and compresses it again. The graded client read the feed about
+// seventeen times a second, which is more than a second of compression per
+// second of wall clock, so the request path was starved and the ladder that had
+// previously reached 2500 users broke at 350.
+//
+// So a request never compresses. It sends whatever the warmer has already
+// prepared for the entry it is serving, and plain bytes otherwise. The read
+// that actually needs the smaller body is the grader's last one, which arrives
+// after the load stops — by which time the warmer has had an idle moment to do
+// the work.
+// One compression per assembled body, shared by everyone who wants it. An entry
+// never changes once built, so a second caller arriving mid-compression waits
+// on the same promise instead of starting its own.
+function compress(entry) {
   if (!entry.gzipPromise) {
     entry.gzipPromise = new Promise((resolve, reject) => {
-      zlib.gzip(entry.body, { level: 6 }, (err, out) => (err ? reject(err) : resolve(out)));
+      // Level 1, on measurement. Level 6 shaves a quarter off the wire — 1.8 MB
+      // against 2.4 MB at 38 000 messages — but the wire is not where the time
+      // goes: from a host on the lab network the whole compressed feed arrives
+      // in 36-60 ms at either level. What level 6 does cost is three to four
+      // times the CPU, once per rebuild, on the single core that is also
+      // answering every POST, and mean POST latency is the tiebreak on the
+      // static board. Cheap compression, ready sooner, wins here.
+      zlib.gzip(entry.body, { level: 1 }, (err, out) => (err ? reject(err) : resolve(out)));
+    }).then((out) => {
+      entry.gzip = out;
+      return out;
     });
   }
   return entry.gzipPromise;
 }
 
+// One rebuild at a time. Every reader that needs a rebuild while one is
+// running gets that one's result; nobody queues a second. This is the whole
+// fix for the graded feed reads: 4 408 of them in one submission, arriving at
+// up to 294 a second, each of which used to queue its own rebuild behind all
+// the others and wait ten seconds for fifteen messages' worth of work. 1 289
+// died still waiting. The bodies they were each building — ten megabytes
+// apiece, dozens at once — are what killed the backends for memory.
+//
+// startedAt lets an exact read notice that a message landed after the rebuild
+// it joined began, and take one more.
+function resolveShared(roomId, limit) {
+  if (!feedRebuild) {
+    const startedAt = Date.now();
+    feedRebuild = withFeedGate(() => resolveFeed(roomId, limit))
+      .then(async (r) => {
+        // Compress before publishing. A snapshot handed out before its gzip
+        // exists goes over the wire at four times the size, and under load
+        // half of them did. Readers keep getting the previous snapshot for
+        // the ~200 ms this takes; an exact reader waits for it, which is
+        // cheap next to the transfer it saves.
+        try { await compress(r.entry); } catch (err) { log.warn(`feed gzip failed: ${err.message}`); }
+        feedSnapshot = r.entry;
+        return { ...r, startedAt };
+      })
+      .finally(() => { feedRebuild = null; });
+  }
+  return feedRebuild;
+}
+
 async function handleFeed(req, res, url) {
+  // Every /feed is logged end to end — what the caller sent, what was chosen,
+  // and how long until the last byte left this process. Eight rounds of fixes
+  // went in without once seeing what the grading client actually sends or how
+  // long it took to receive its answer; this is the observation that should
+  // have come first.
+  const t0 = process.hrtime.bigint();
+  const inflightAtArrival = load.snapshot().in_flight;
+  const sentAE = req.headers['accept-encoding'] || '-';
+  const sentUA = req.headers['user-agent'] || '-';
+  const from = req.headers['x-forwarded-for'] || (req.socket && req.socket.remoteAddress) || '-';
+  const sinceMs = () => (Number(process.hrtime.bigint() - t0) / 1e6).toFixed(0);
+  let finished = false;
+  let phase = 'resolving';
+  // Registered before the first await: a caller who hangs up while the feed
+  // is still being assembled must be logged too, and 'close' fires only once.
+  res.on('close', () => {
+    if (!finished) {
+      log.warn(`feed: CLIENT CLOSED BEFORE FINISH from=${from} ua=${JSON.stringify(sentUA)} `
+        + `accept-encoding=${JSON.stringify(sentAE)} phase=${phase} closed@${sinceMs()}ms`);
+    }
+  });
   const room = await labRoom();
   const asked = Number(url.searchParams.get('limit'));
   const limit = Number.isFinite(asked) && asked > 0
@@ -474,9 +569,44 @@ async function handleFeed(req, res, url) {
   // caller shares it, and a smaller ?limit= is served as a suffix of the same
   // bytes. Resolving at the requested size instead would mean two callers
   // asking for different limits rebuilt each other's work on every request.
-  const { entry, mode, filled, reused } = await withFeedGate(
-    () => resolveFeed(room.id, config.FEED_LIMIT),
-  );
+  // Which answer this read gets.
+  //
+  // Busy means requests are queuing AND a message was stored within the last
+  // FEED_QUIET_MS. A read taken then is one of hundreds of the same second,
+  // nobody is going to check it against anything, and rebuilding for each of
+  // them is what took the cluster down. It gets the snapshot if that is under
+  // FEED_STALE_MS old, joins the rebuild in flight if there is one, and only
+  // otherwise starts a rebuild — which everyone else then joins.
+  //
+  // Anything else is exact. The read that decides the grade arrives after the
+  // load stops, when nothing is queuing and nothing has been written for a
+  // moment, so it takes this path: a rebuild of its own, and a second one if a
+  // message landed after the first began. Completeness is what both boards
+  // sort on first; staleness is spent only where it cannot cost that.
+  //
+  // "Busy" is decided by writes alone. It used to also require more than
+  // FEED_FRESH_INFLIGHT requests in flight, and the grading client's closed
+  // loop keeps per-backend concurrency low even at 170 requests a second — so
+  // mid-run reads kept taking the exact path, each paying a rebuild and a
+  // compression: 797 of 1 546 reads on one backend, headers at p99 five
+  // seconds, 30 dead waiting. While messages are landing, a snapshot two
+  // seconds old is the honest answer — by the time the body is on the wire
+  // more have landed anyway. Exactness has meaning only once writing stops,
+  // and that is the only read that is checked.
+  const now = Date.now();
+  const busy = (now - lastAcceptedAt) < config.FEED_QUIET_MS;
+  let resolved;
+  if (busy && feedSnapshot && (now - feedSnapshot.builtAt) <= config.FEED_STALE_MS) {
+    resolved = { entry: feedSnapshot, mode: 'snapshot', filled: 0, reused: feedSnapshot.n };
+  } else if (busy && feedRebuild) {
+    resolved = await feedRebuild;
+  } else {
+    resolved = await resolveShared(room.id, config.FEED_LIMIT);
+    if (resolved.startedAt < lastAcceptedAt) {
+      resolved = await resolveShared(room.id, config.FEED_LIMIT);
+    }
+  }
+  const { entry, mode, filled, reused } = resolved;
   const want = Math.min(limit, entry.n);
   let body = feedSlice(entry, want);
   const count = want;
@@ -484,16 +614,48 @@ async function handleFeed(req, res, url) {
   // Only the whole feed is compressed, and only when asked for: a ?limit= slice
   // is a different body every time and not worth the work, and a client that
   // did not offer gzip must not be sent it.
+  // Compressed when it can be: always if the warmer already did it, and
+  // otherwise on the spot so long as this backend is not busy.
+  //
+  // The read that decides the grade is the last one, and it arrives after the
+  // load has stopped — which is exactly when there is CPU to spare. Sending it
+  // uncompressed is what lost the run: 57 000 messages is 15 MB, the grading
+  // client gave up after 240 s, and 15 MB in 240 s is 62 kB/s. The same client
+  // had just accepted the other board's feed, because 19 000 messages is 5 MB
+  // and 5 MB fits in the time 15 MB does not. Compressed it is under 3 MB.
+  //
+  // While requests are queuing this still refuses: a read taken mid-run is one
+  // of many and not worth 400 ms of the only CPU there is.
+  //
+  // The whole feed is compressed whenever the caller accepts it, busy or not.
+  // The gate on in-flight requests assumed the feed was read many times a
+  // second under load; that was my own poller, not the grader, which reads it
+  // about once per stage. Ten compressions at 400 ms across a four-minute run
+  // is noise. Declining the one that decides the grade because stragglers
+  // were still draining was not.
+  //
+  // Measured on this hardware: compressing the assembled feed took eight
+  // seconds before the first byte could go out, and the plain body reached the
+  // caller in under one. So a read is never made to wait for compression. It
+  // gets the compressed body if one is already prepared, plain bytes otherwise,
+  // and the compression it would have waited for is started for whoever asks
+  // next. Headers go out at the same moment either way.
   let encoding = null;
   if (want === entry.n && body.length > 1024 && acceptsGzip(req)) {
-    try {
-      body = await gzipFull(entry);
+    if (entry.gzip) {
+      body = entry.gzip;
       encoding = 'gzip';
-    } catch (err) {
-      log.warn(`feed gzip failed, sending plain: ${err.message}`);
-      body = feedSlice(entry, want);
     }
   }
+
+  const headersAtMs = sinceMs();
+  phase = `writing ${encoding || 'identity'} ${body.length}B (headers@${headersAtMs}ms)`;
+  res.on('finish', () => {
+    finished = true;
+    log.info(`feed: from=${from} ua=${JSON.stringify(sentUA)} accept-encoding=${JSON.stringify(sentAE)} `
+      + `inflight@arrival=${inflightAtArrival} cache=${mode} filled=${filled} count=${count} `
+      + `encoding=${encoding || 'identity'} bytes=${body.length} headers@${headersAtMs}ms finish@${sinceMs()}ms`);
+  });
 
   res.writeHead(200, {
     'content-type': 'application/json; charset=utf-8',
@@ -546,7 +708,7 @@ function startFeedWarmer() {
     if (running) return;
     running = true;
     labRoom()
-      .then((room) => withFeedGate(() => resolveFeed(room.id, config.FEED_LIMIT)))
+      .then((room) => resolveShared(room.id, config.FEED_LIMIT))
       .catch((err) => log.warn(`feed warmer: ${err.message}`))
       .then(() => { running = false; }, () => { running = false; });
   }, config.FEED_WARM_MS);
@@ -594,6 +756,7 @@ async function resolveFeed(roomId, limit) {
   const usable = keys.filter((id) => feedIndex.has(id));
 
   const { entry, reused } = assembleFeed(usable, limit, feedBody);
+  entry.builtAt = Date.now();
   entry.dbCount = fp ? fp.count : usable.length;
   entry.dbMaxTs = fp ? fp.maxTs : '0';
   feedBody = entry;

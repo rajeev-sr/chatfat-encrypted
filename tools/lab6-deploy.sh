@@ -76,9 +76,9 @@ fi
 source "$ENV_FILE"
 : "${DATABASE_URL:?set DATABASE_URL in tools/lab6.env}"
 : "${MASTER_KEY:?set MASTER_KEY in tools/lab6.env}"
-DB_POOL_MAX="${DB_POOL_MAX:-40}"
+DB_POOL_MAX="${DB_POOL_MAX:-12}"   # 3 backends x 12 + warmers stays under max_connections=60
 STRATEGY="${STRATEGY:-p2c}"
-LOAD_THRESHOLD="${LOAD_THRESHOLD:-50}"
+LOAD_THRESHOLD="${LOAD_THRESHOLD:-150}"
 # Plain HTTP by default. The grading client speaks http:// — a TLS listener
 # answers a plaintext request with 400 and rejects an unverified HTTPS one, so
 # an HTTPS-only endpoint fails whichever way the client connects. TLS also cost
@@ -166,12 +166,20 @@ ok "sys1 load balancer built"
 say "3/4  starting backends (container port $APP_PORT -> public 3274-3276)"
 for n in 2 3 4; do
   name="backend-$((n - 1))"
+  # V8 sized for a one-CPU cgroup: a 32 MB young generation (a third as many
+  # scavenges) and GC on the main thread, because helper threads cannot run in
+  # parallel inside a one-CPU quota — they only burn it faster and get the whole
+  # process throttled. Measured +30-60% requests per CPU-second per flag. The
+  # system that also runs Postgres keeps the default young generation: its
+  # 512 MB is shared with the database and the extra 80 MB is not free there.
+  NODE_FLAGS="--single-threaded-gc"
+  [ "$n" -ne 4 ] && NODE_FLAGS="--max-semi-space-size=32 --single-threaded-gc"
   ssh_sys "$n" "
     tmux kill-session -t backend 2>/dev/null
     tmux new -d -s backend
     tmux send-keys -t backend 'ulimit -n $FD_LIMIT; cd ~/$REPO_DIR && PORT=$APP_PORT BACKEND_NAME=$name \
       DATABASE_URL=\"$DATABASE_URL\" MASTER_KEY=\"$MASTER_KEY\" DB_POOL_MAX=$DB_POOL_MAX \
-      BENCH_ENABLED=1 TLS_CERT_FILE= TLS_KEY_FILE= node server.js' C-m
+      BENCH_ENABLED=1 TLS_CERT_FILE= TLS_KEY_FILE= node $NODE_FLAGS server.js' C-m
     sleep 6" >/dev/null 2>&1
   if out=$(curl -s -m 8 "http://$HOST:$((3272 + n))/statz" 2>/dev/null); then
     ok "sys$n $(echo "$out" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["backend"],"up")' 2>/dev/null || echo up)"
@@ -193,7 +201,7 @@ ssh_sys 1 "
   tmux send-keys -t lb 'ulimit -n $FD_LIMIT; cd ~/$REPO_DIR && ./bin/lb -listen 0.0.0.0:$APP_PORT \
     -backends $BACKENDS \
     -strategy $STRATEGY -load-threshold $LOAD_THRESHOLD \
-    -health-timeout 5s -backend-timeout 180s $TLS_ARGS' C-m
+    -health-timeout 5s -backend-timeout 150s $TLS_ARGS' C-m
   sleep 5" >/dev/null 2>&1
 
 if st=$(curl -sk -m 10 "$LB_PUBLIC/lb/status" 2>/dev/null); then

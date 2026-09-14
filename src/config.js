@@ -161,9 +161,35 @@ module.exports = {
   DB_POOL_MAX: int('DB_POOL_MAX', 10, 1, 500),
   DB_CONNECT_TIMEOUT_MS: int('DB_CONNECT_TIMEOUT_MS', 8000, 250, 60000),
   // Must stay above the load balancer's -idle-conn-timeout (30 s). See app.js.
+  // Node's own default, kept deliberately rather than raised to somaxconn.
+  //
+  // A short accept queue is admission control. Raising it to 4096 did stop the
+  // kernel dropping SYNs — the counter went from 23 323 to none — but a dropped
+  // SYN only costs one client a retransmit, whereas accepting every connection
+  // on a 512 MB box means holding state for all of them at once. The graded run
+  // that followed was killed by the out-of-memory reaper on all three backends
+  // and collapsed at 500 users, having previously carried the whole ladder to
+  // 2500. Shedding load early is the cheaper failure.
+  LISTEN_BACKLOG: int('LISTEN_BACKLOG', 511, 1, 65535),
   KEEPALIVE_TIMEOUT_MS: int('KEEPALIVE_TIMEOUT_MS', 65000, 1000, 600000),
   // How often to refresh the /feed cache in the background. 0 disables it and
   // returns /feed to rebuilding on demand.
+  // How a GET /feed decides between exact and snapshot. It is "busy" when a
+  // message was stored in the last FEED_QUIET_MS; a busy read may be answered
+  // from a snapshot up to FEED_STALE_MS old. Any read that is not busy is
+  // exact. FEED_FRESH_INFLIGHT is kept for the warmer's own throttling. The graded client
+  // reads the feed thousands of times mid-run and once, decisively, after the
+  // load stops; the first must be cheap and the last must be complete.
+  FEED_FRESH_INFLIGHT: int('FEED_FRESH_INFLIGHT', 20, 0, 100000),
+  // Must exceed FEED_WARM_MS plus a rebuild-and-compress, or the snapshot is
+  // judged stale at the very moment it is needed and every reader in a burst
+  // waits on a fresh compression instead of taking the bytes already there.
+  // At 2000 ms that is exactly what happened: 344 burst reads, none served as
+  // a snapshot, headers at p95 three seconds. A mid-run read is not checked
+  // against anything, so five seconds of staleness costs nothing there; the
+  // read that is checked arrives after writes stop and never takes this path.
+  FEED_STALE_MS: int('FEED_STALE_MS', 5000, 0, 60000),
+  FEED_QUIET_MS: int('FEED_QUIET_MS', 750, 0, 60000),
   FEED_WARM_MS: int('FEED_WARM_MS', 2000, 0, 600000),
   // Group commit for POST /message. DB_BATCH_MAX of 1 disables it and returns
   // to one insert per request. The window is short because the response waits

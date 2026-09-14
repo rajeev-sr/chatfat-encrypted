@@ -390,7 +390,24 @@ class PgRepo {
     const res = await pool.query(
       {
         name: 'msg_feed_keys',
-        text: `select array_agg(id order by ts asc, id asc) as ids from (
+        // Aggregated newest-first and reversed by the caller, rather than
+        // asking the database to sort.
+        //
+        // The inner scan already walks (room_id, ts desc, id desc) in index
+        // order, so an `order by ts asc, id asc` inside array_agg re-sorts rows
+        // that arrived sorted. At 80 000 ids that sort needs about 5 MB and
+        // work_mem here is 2 MB, so it spilled: "Sort Method: external merge
+        // Disk: 5168kB", 360 ms on an idle database and far worse on a busy
+        // one sharing its disk with three backends writing. Below roughly
+        // 30 000 messages the same sort fits in memory and costs nothing, which
+        // is why the static board — which never grew that large — always passed
+        // while the breakpoint board, ending near 57 000, timed out its final
+        // GET /feed every single run.
+        //
+        // An aggregate consumes rows in the order its input delivers them, and
+        // with an ordered Limit feeding it directly there is no node in between
+        // to reorder anything. The suite checks the result is ascending.
+        text: `select array_agg(id) as ids from (
            select id, ts from messages
            where room_id = $1 and unsent = false
            order by ts desc, id desc limit $2
@@ -398,7 +415,9 @@ class PgRepo {
       },
       [roomId, limit],
     );
-    return (res.rows[0] && res.rows[0].ids) || [];
+    const ids = (res.rows[0] && res.rows[0].ids) || [];
+    ids.reverse();
+    return ids;
   }
 
   // Full messages for a set of ids, decrypted. The feed uses it to fill in only
